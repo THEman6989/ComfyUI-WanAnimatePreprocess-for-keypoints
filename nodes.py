@@ -8,7 +8,7 @@ import folder_paths
 import cv2
 import json
 import logging
-from typing import Any, Dict, Iterable, List, Tuple, Union
+from typing import Any, Dict, Iterable, List, Tuple, Union, Optional
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
 from comfy import model_management as mm
@@ -446,15 +446,72 @@ class PoseDataManipulator:
             return []
         return [idx for idx in spec if isinstance(idx, int) and 0 <= idx < count]
 
+    def _clone_meta(self, meta: Any) -> Any:
+        if isinstance(meta, AAPoseMeta):
+            cloned = AAPoseMeta()
+            cloned.image_id = getattr(meta, "image_id", "")
+            cloned.width = getattr(meta, "width", 0)
+            cloned.height = getattr(meta, "height", 0)
+            cloned.kps_body = None if meta.kps_body is None else np.array(meta.kps_body, copy=True)
+            cloned.kps_body_p = None if meta.kps_body_p is None else np.array(meta.kps_body_p, copy=True)
+            cloned.kps_lhand = None if meta.kps_lhand is None else np.array(meta.kps_lhand, copy=True)
+            cloned.kps_lhand_p = None if meta.kps_lhand_p is None else np.array(meta.kps_lhand_p, copy=True)
+            cloned.kps_rhand = None if meta.kps_rhand is None else np.array(meta.kps_rhand, copy=True)
+            cloned.kps_rhand_p = None if meta.kps_rhand_p is None else np.array(meta.kps_rhand_p, copy=True)
+            cloned.kps_face = None if meta.kps_face is None else np.array(meta.kps_face, copy=True)
+            cloned.kps_face_p = None if meta.kps_face_p is None else np.array(meta.kps_face_p, copy=True)
+            return cloned
+        if isinstance(meta, dict):
+            cloned_dict: Dict[str, Any] = {}
+            for key, value in meta.items():
+                if isinstance(value, np.ndarray):
+                    cloned_dict[key] = value.copy()
+                else:
+                    cloned_dict[key] = copy.deepcopy(value)
+            return cloned_dict
+        return copy.deepcopy(meta)
+
+    def _ensure_array(self, data: Any) -> Optional[np.ndarray]:
+        if data is None:
+            return None
+        if isinstance(data, np.ndarray):
+            return data
+        try:
+            return np.asarray(data, dtype=np.float32)
+        except (TypeError, ValueError):
+            return np.asarray(data, dtype=object)
+
     def _transform_block(self, coords: np.ndarray, indices: List[int], width: float, height: float,
-                         offset_x: float, offset_y: float, scale: float, clamp: bool) -> None:
+                         offset_x: float, offset_y: float, scale: float, clamp: bool) -> List[int]:
         if coords is None or not indices:
-            return
+            return []
+
+        view = np.asarray(coords)
+        if view.ndim != 2 or view.shape[1] < 2:
+            return []
+
         width = max(float(width), 1.0)
         height = max(float(height), 1.0)
-        selected = coords[indices].astype(np.float32)
-        if selected.size == 0:
-            return
+
+        valid_indices: List[int] = []
+        selected_coords: List[List[float]] = []
+        for idx in indices:
+            if not (0 <= idx < view.shape[0]):
+                continue
+            try:
+                x_val = float(view[idx, 0])
+                y_val = float(view[idx, 1])
+            except (TypeError, ValueError):
+                continue
+            if not (math.isfinite(x_val) and math.isfinite(y_val)):
+                continue
+            valid_indices.append(idx)
+            selected_coords.append([x_val, y_val])
+
+        if not selected_coords:
+            return []
+
+        selected = np.asarray(selected_coords, dtype=np.float32)
         norm = selected / np.array([width, height], dtype=np.float32)
         center = norm.mean(axis=0, keepdims=True)
         norm = (norm - center) * scale + center
@@ -462,40 +519,71 @@ class PoseDataManipulator:
         norm[:, 1] += offset_y
         if clamp:
             norm = np.clip(norm, 0.0, 1.0)
-        coords[indices, 0] = norm[:, 0] * width
-        coords[indices, 1] = norm[:, 1] * height
 
-    def _scale_confidences(self, conf: np.ndarray, indices: List[int], factor: float) -> None:
+        for list_idx, (nx, ny) in zip(valid_indices, norm):
+            coords[list_idx, 0] = float(nx * width)
+            coords[list_idx, 1] = float(ny * height)
+
+        return valid_indices
+
+    def _scale_confidences(self, conf: Any, indices: List[int], factor: float) -> None:
         if conf is None or not indices:
             return
-        conf[indices] = np.clip(conf[indices] * factor, 0.0, 1.0)
+        if factor == 1.0:
+            return
+        for idx in indices:
+            if not (isinstance(idx, int) and idx >= 0):
+                continue
+            try:
+                current = float(conf[idx])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if not math.isfinite(current):
+                continue
+            new_val = float(np.clip(current * factor, 0.0, 1.0))
+            try:
+                conf[idx] = new_val
+            except TypeError:
+                if isinstance(conf, np.ndarray):
+                    conf[idx] = new_val
 
     def _manipulate_aapose(self, meta: AAPoseMeta, part_map: Dict[str, Union[List[int], str]], offset_x: float,
                             offset_y: float, scale: float, confidence_scale: float, clamp: bool) -> None:
         if meta is None:
             return
-        body_indices = self._valid_indices(meta.kps_body.shape[0] if meta.kps_body is not None else 0,
-                                           part_map.get("body", []))
-        self._transform_block(meta.kps_body, body_indices, meta.width, meta.height, offset_x, offset_y, scale, clamp)
-        self._scale_confidences(meta.kps_body_p, body_indices, confidence_scale)
+        meta.kps_body = self._ensure_array(meta.kps_body)
+        meta.kps_body_p = self._ensure_array(meta.kps_body_p)
+        meta.kps_lhand = self._ensure_array(meta.kps_lhand)
+        meta.kps_lhand_p = self._ensure_array(meta.kps_lhand_p)
+        meta.kps_rhand = self._ensure_array(meta.kps_rhand)
+        meta.kps_rhand_p = self._ensure_array(meta.kps_rhand_p)
+        meta.kps_face = self._ensure_array(meta.kps_face)
+        meta.kps_face_p = self._ensure_array(meta.kps_face_p)
+
+        body_indices = self._valid_indices(
+            meta.kps_body.shape[0] if isinstance(meta.kps_body, np.ndarray) else 0,
+            part_map.get("body", []),
+        )
+        modified = self._transform_block(meta.kps_body, body_indices, meta.width, meta.height, offset_x, offset_y, scale, clamp)
+        self._scale_confidences(meta.kps_body_p, modified, confidence_scale)
 
         lhand_spec = part_map.get("lhand")
-        if meta.kps_lhand is not None and lhand_spec is not None:
+        if isinstance(meta.kps_lhand, np.ndarray) and lhand_spec is not None:
             l_indices = self._valid_indices(meta.kps_lhand.shape[0], lhand_spec)
-            self._transform_block(meta.kps_lhand, l_indices, meta.width, meta.height, offset_x, offset_y, scale, clamp)
-            self._scale_confidences(meta.kps_lhand_p, l_indices, confidence_scale)
+            modified = self._transform_block(meta.kps_lhand, l_indices, meta.width, meta.height, offset_x, offset_y, scale, clamp)
+            self._scale_confidences(meta.kps_lhand_p, modified, confidence_scale)
 
         rhand_spec = part_map.get("rhand")
-        if meta.kps_rhand is not None and rhand_spec is not None:
+        if isinstance(meta.kps_rhand, np.ndarray) and rhand_spec is not None:
             r_indices = self._valid_indices(meta.kps_rhand.shape[0], rhand_spec)
-            self._transform_block(meta.kps_rhand, r_indices, meta.width, meta.height, offset_x, offset_y, scale, clamp)
-            self._scale_confidences(meta.kps_rhand_p, r_indices, confidence_scale)
+            modified = self._transform_block(meta.kps_rhand, r_indices, meta.width, meta.height, offset_x, offset_y, scale, clamp)
+            self._scale_confidences(meta.kps_rhand_p, modified, confidence_scale)
 
         face_spec = part_map.get("face")
-        if meta.kps_face is not None and face_spec is not None:
+        if isinstance(meta.kps_face, np.ndarray) and face_spec is not None:
             f_indices = self._valid_indices(meta.kps_face.shape[0], face_spec)
-            self._transform_block(meta.kps_face, f_indices, meta.width, meta.height, offset_x, offset_y, scale, clamp)
-            self._scale_confidences(meta.kps_face_p, f_indices, confidence_scale)
+            modified = self._transform_block(meta.kps_face, f_indices, meta.width, meta.height, offset_x, offset_y, scale, clamp)
+            self._scale_confidences(meta.kps_face_p, modified, confidence_scale)
 
     def _manipulate_dict_meta(self, meta: Dict[str, Any], part_map: Dict[str, Union[List[int], str]], offset_x: float,
                               offset_y: float, scale: float, confidence_scale: float, clamp: bool) -> None:
@@ -510,18 +598,26 @@ class PoseDataManipulator:
             arr = meta.get(key)
             if arr is None:
                 return
-            arr_np = np.asarray(arr, dtype=np.float32)
+            arr_np = np.asarray(arr)
             if arr_np.ndim != 2 or arr_np.shape[1] < 2:
                 return
             indices = self._valid_indices(arr_np.shape[0], indices_spec)
             if not indices:
                 return
-            coords = arr_np[:, :2].copy()
-            self._transform_block(coords, indices, width, height, offset_x, offset_y, scale, clamp)
-            arr_np[indices, :2] = coords[indices]
+            modified = self._transform_block(arr_np, indices, width, height, offset_x, offset_y, scale, clamp)
+            if not modified:
+                return
             if arr_np.shape[1] >= 3:
-                arr_np[indices, 2] = np.clip(arr_np[indices, 2] * confidence_scale, 0.0, 1.0)
-            meta[key] = arr_np
+                for idx in modified:
+                    try:
+                        score_val = float(arr_np[idx, 2])
+                    except (TypeError, ValueError):
+                        continue
+                    arr_np[idx, 2] = float(np.clip(score_val * confidence_scale, 0.0, 1.0))
+            if isinstance(arr, list):
+                meta[key] = arr_np.tolist()
+            else:
+                meta[key] = arr_np
 
         transform_array("keypoints_body", part_map.get("body"))
         transform_array("keypoints_left_hand", part_map.get("lhand"))
@@ -540,7 +636,15 @@ class PoseDataManipulator:
 
     def manipulate(self, pose_data, part, offset_x, offset_y, scale, confidence_scale,
                    apply_to_retarget=True, apply_to_original=True, apply_to_reference=False, clamp_to_unit=True):
-        updated_pose_data = copy.deepcopy(pose_data)
+        updated_pose_data = dict(pose_data)
+        if "pose_metas" in pose_data:
+            updated_pose_data["pose_metas"] = [self._clone_meta(meta) for meta in pose_data.get("pose_metas", [])]
+        if "pose_metas_original" in pose_data:
+            updated_pose_data["pose_metas_original"] = [
+                self._clone_meta(meta) for meta in pose_data.get("pose_metas_original", [])
+            ]
+        if pose_data.get("refer_pose_meta") is not None:
+            updated_pose_data["refer_pose_meta"] = self._clone_meta(pose_data.get("refer_pose_meta"))
         part_map = self._collect_indices(part)
 
         if apply_to_retarget:
@@ -572,6 +676,18 @@ class PoseDataToOpenPose:
                 "use_retarget_pose": ("BOOLEAN", {"default": False, "tooltip": "When true, convert the retargeted pose instead of the original detection."}),
                 "include_face": ("BOOLEAN", {"default": True, "tooltip": "Include face keypoints in the exported data."}),
                 "include_hands": ("BOOLEAN", {"default": True, "tooltip": "Include hand keypoints in the exported data."}),
+            },
+            "optional": {
+                "confidence_override": (
+                    "FLOAT",
+                    {
+                        "default": -1.0,
+                        "min": -1.0,
+                        "max": 5.0,
+                        "step": 0.01,
+                        "tooltip": "Set all confidence scores to this value. Use -1 to keep original confidences.",
+                    },
+                ),
             }
         }
 
@@ -614,12 +730,22 @@ class PoseDataToOpenPose:
 
         return width, height, body, lhand, rhand, face
 
-    def _to_openpose_list(self, keypoints: np.ndarray, width: int, height: int) -> List[float]:
+    def _to_openpose_list(
+        self,
+        keypoints: np.ndarray,
+        width: int,
+        height: int,
+        confidence_override: Optional[float] = None,
+    ) -> List[float]:
         if keypoints.size == 0:
             return []
 
         coords = keypoints[:, :2]
         conf = keypoints[:, 2] if keypoints.shape[1] > 2 else np.ones(keypoints.shape[0], dtype=np.float32)
+
+        if confidence_override is not None:
+            override_val = float(np.clip(confidence_override, 0.0, 5.0))
+            conf = np.full(conf.shape, override_val, dtype=np.float32)
 
         max_coord = np.max(coords) if coords.size else 0
         if max_coord <= 1.5:
@@ -634,7 +760,14 @@ class PoseDataToOpenPose:
             openpose_kps.extend([float(x), float(y), float(c)])
         return openpose_kps
 
-    def _meta_to_openpose_frame(self, meta: Any, include_face: bool, include_hands: bool, frame_index: int) -> Dict[str, Any]:
+    def _meta_to_openpose_frame(
+        self,
+        meta: Any,
+        include_face: bool,
+        include_hands: bool,
+        frame_index: int,
+        confidence_override: Optional[float] = None,
+    ) -> Dict[str, Any]:
         width, height, body, lhand, rhand, face = self._meta_to_arrays(meta)
 
         frame_entry: Dict[str, Any] = {
@@ -642,13 +775,19 @@ class PoseDataToOpenPose:
             "people": [
                 {
                     "person_id": [-1],
-                    "pose_keypoints_2d": self._to_openpose_list(body, width, height),
+                    "pose_keypoints_2d": self._to_openpose_list(body, width, height, confidence_override),
                     "pose_keypoints_3d": [],
-                    "face_keypoints_2d": self._to_openpose_list(face, width, height) if include_face else [],
+                    "face_keypoints_2d": self._to_openpose_list(face, width, height, confidence_override)
+                    if include_face
+                    else [],
                     "face_keypoints_3d": [],
-                    "hand_left_keypoints_2d": self._to_openpose_list(lhand, width, height) if include_hands else [],
+                    "hand_left_keypoints_2d": self._to_openpose_list(lhand, width, height, confidence_override)
+                    if include_hands
+                    else [],
                     "hand_left_keypoints_3d": [],
-                    "hand_right_keypoints_2d": self._to_openpose_list(rhand, width, height) if include_hands else [],
+                    "hand_right_keypoints_2d": self._to_openpose_list(rhand, width, height, confidence_override)
+                    if include_hands
+                    else [],
                     "hand_right_keypoints_3d": [],
                 }
             ],
@@ -659,15 +798,32 @@ class PoseDataToOpenPose:
 
         return frame_entry
 
-    def convert(self, pose_data, use_retarget_pose=False, include_face=True, include_hands=True):
+    def convert(
+        self,
+        pose_data,
+        use_retarget_pose=False,
+        include_face=True,
+        include_hands=True,
+        confidence_override: Optional[float] = None,
+    ):
         metas_source_key = "pose_metas" if use_retarget_pose else "pose_metas_original"
         metas: Iterable[Any] = pose_data.get(metas_source_key, [])
         if not metas:
             metas = pose_data.get("pose_metas_original", [])
 
+        override_value: Optional[float] = None
+        if confidence_override is not None and float(confidence_override) >= 0.0:
+            override_value = float(np.clip(confidence_override, 0.0, 5.0))
+
         openpose_frames: List[Dict[str, Any]] = []
         for idx, meta in enumerate(metas):
-            frame_entry = self._meta_to_openpose_frame(meta, include_face, include_hands, idx)
+            frame_entry = self._meta_to_openpose_frame(
+                meta,
+                include_face,
+                include_hands,
+                idx,
+                override_value,
+            )
             openpose_frames.append(frame_entry)
 
         json_output = json.dumps(openpose_frames, ensure_ascii=False)
@@ -697,6 +853,16 @@ class PoseDataToOpenPoseKeypoints:
                         "tooltip": "Frame index to extract keypoints from. Clamped to the available range.",
                     },
                 ),
+                "confidence_override": (
+                    "FLOAT",
+                    {
+                        "default": -1.0,
+                        "min": -1.0,
+                        "max": 5.0,
+                        "step": 0.01,
+                        "tooltip": "Set all confidence scores to this value. Use -1 to keep original confidences.",
+                    },
+                ),
             }
         }
 
@@ -709,16 +875,25 @@ class PoseDataToOpenPoseKeypoints:
         "both a selected frame and the entire sequence."
     )
 
-    def convert(self, pose_data, use_retarget_pose=False, frame_index=0):
+    def convert(self, pose_data, use_retarget_pose=False, frame_index=0, confidence_override=-1.0):
         source_key = "pose_metas" if use_retarget_pose else "pose_metas_original"
         metas: Iterable[Any] = pose_data.get(source_key, [])
         if not metas:
             metas = pose_data.get("pose_metas_original", [])
 
         converter = PoseDataToOpenPose()
+        override_value: Optional[float] = None
+        if confidence_override is not None and float(confidence_override) >= 0.0:
+            override_value = float(np.clip(confidence_override, 0.0, 5.0))
         frames: List[Dict[str, Any]] = []
         for idx, meta in enumerate(metas):
-            frame_entry = converter._meta_to_openpose_frame(meta, include_face=True, include_hands=True, frame_index=idx)
+            frame_entry = converter._meta_to_openpose_frame(
+                meta,
+                include_face=True,
+                include_hands=True,
+                frame_index=idx,
+                confidence_override=override_value,
+            )
             frames.append(frame_entry)
 
         if not frames:
@@ -890,7 +1065,7 @@ class KeyFrameBodyPointsToOpenPoseKeypoints:
                     {
                         "default": 1.0,
                         "min": 0.0,
-                        "max": 1.0,
+                        "max": 5.0,
                         "step": 0.01,
                         "tooltip": "Fallback confidence value applied when none is provided for a keypoint.",
                     },
@@ -915,6 +1090,16 @@ class KeyFrameBodyPointsToOpenPoseKeypoints:
                         "tooltip": "Canvas height for the generated OpenPose frame. Set to -1 to infer from the data.",
                     },
                 ),
+                "confidence_override": (
+                    "FLOAT",
+                    {
+                        "default": -1.0,
+                        "min": -1.0,
+                        "max": 5.0,
+                        "step": 0.01,
+                        "tooltip": "Set all exported confidences to this value. Use -1 to keep the detected confidences.",
+                    },
+                ),
             },
         }
 
@@ -926,7 +1111,14 @@ class KeyFrameBodyPointsToOpenPoseKeypoints:
         "Converts key frame body points into an OpenPose POSE_KEYPOINT frame matching the Ultimate OpenPose Editor format."
     )
 
-    def convert(self, key_frame_body_points, default_confidence=1.0, canvas_width=-1, canvas_height=-1):
+    def convert(
+        self,
+        key_frame_body_points,
+        default_confidence=1.0,
+        canvas_width=-1,
+        canvas_height=-1,
+        confidence_override=-1.0,
+    ):
         try:
             parsed = json.loads(key_frame_body_points)
         except (json.JSONDecodeError, TypeError):
@@ -949,6 +1141,10 @@ class KeyFrameBodyPointsToOpenPoseKeypoints:
         xs: List[float] = []
         ys: List[float] = []
 
+        override_value: Optional[float] = None
+        if confidence_override is not None and float(confidence_override) >= 0.0:
+            override_value = float(np.clip(confidence_override, 0.0, 5.0))
+
         for entry, body_index in zip(points_iterable, resolved_indices):
             if body_index is None or not isinstance(entry, dict):
                 continue
@@ -958,14 +1154,17 @@ class KeyFrameBodyPointsToOpenPoseKeypoints:
             except (TypeError, ValueError):
                 continue
 
-            confidence = entry.get("confidence")
-            if confidence is None:
-                confidence = entry.get("score", default_confidence)
-            try:
-                c_val = float(confidence)
-            except (TypeError, ValueError):
-                c_val = float(default_confidence)
-            c_val = float(np.clip(c_val, 0.0, 1.0))
+            if override_value is not None:
+                c_val = override_value
+            else:
+                confidence = entry.get("confidence")
+                if confidence is None:
+                    confidence = entry.get("score", default_confidence)
+                try:
+                    c_val = float(confidence)
+                except (TypeError, ValueError):
+                    c_val = float(default_confidence)
+                c_val = float(np.clip(c_val, 0.0, 5.0))
 
             slot = int(body_index) * 3
             if 0 <= slot <= len(body_keypoints) - 3:
