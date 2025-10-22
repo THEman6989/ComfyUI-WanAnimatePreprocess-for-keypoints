@@ -23,6 +23,29 @@ from .utils import get_face_bboxes, padding_resize, resize_by_area, resize_to_bo
 from .pose_utils.human_visualization import AAPoseMeta, draw_aapose_by_meta_new, draw_aaface_by_meta
 from .retarget_pose import get_retarget_pose
 
+COCO_BODY_KEYPOINT_NAMES: Tuple[str, ...] = (
+    "nose",
+    "left_eye",
+    "right_eye",
+    "left_ear",
+    "right_ear",
+    "left_shoulder",
+    "right_shoulder",
+    "left_elbow",
+    "right_elbow",
+    "left_wrist",
+    "right_wrist",
+    "left_hip",
+    "right_hip",
+    "left_knee",
+    "right_knee",
+    "left_ankle",
+    "right_ankle",
+)
+
+KEY_FRAME_BODY_INDICES: Tuple[int, ...] = tuple(range(len(COCO_BODY_KEYPOINT_NAMES)))
+LEGACY_KEY_FRAME_BODY_INDICES: Tuple[int, ...] = (0, 1, 2, 5, 8, 11, 10, 13)
+
 class OnnxDetectionModelLoader:
     @classmethod
     def INPUT_TYPES(s):
@@ -189,23 +212,52 @@ class PoseAndFaceDetection:
         key_frame_step = len(pose_metas) // key_frame_num
         key_frame_index_list = list(range(0, len(pose_metas), key_frame_step))
 
-        key_points_index = [0, 1, 2, 5, 8, 11, 10, 13]
+        key_points_index = list(KEY_FRAME_BODY_INDICES)
 
+        points_dict_list: List[Dict[str, Any]] = []
         for key_frame_index in key_frame_index_list:
             keypoints_body_list = []
             body_key_points = pose_metas[key_frame_index]['keypoints_body']
             for each_index in key_points_index:
-                each_keypoint = body_key_points[each_index]
-                if None is each_keypoint:
+                if each_index >= len(body_key_points):
                     continue
-                keypoints_body_list.append(each_keypoint)
+                each_keypoint = body_key_points[each_index]
+                if each_keypoint is None:
+                    continue
+                keypoints_body_list.append((each_index, each_keypoint))
 
-            keypoints_body = np.array(keypoints_body_list)[:, :2]
-            wh = np.array([[pose_metas[0]['width'], pose_metas[0]['height']]])
-            points = (keypoints_body * wh).astype(np.int32)
-            points_dict_list = []
-            for point in points:
-                points_dict_list.append({"x": int(point[0]), "y": int(point[1])})
+            if not keypoints_body_list:
+                continue
+
+            meta_wh = np.array([
+                float(pose_metas[key_frame_index].get('width', pose_metas[0]['width'])),
+                float(pose_metas[key_frame_index].get('height', pose_metas[0]['height'])),
+            ], dtype=np.float32)
+
+            frame_points: List[Dict[str, Any]] = []
+            for original_index, keypoint in keypoints_body_list:
+                coords = np.asarray(keypoint[:2], dtype=np.float32) * meta_wh
+                entry: Dict[str, Any] = {
+                    "index": int(original_index),
+                    "name": COCO_BODY_KEYPOINT_NAMES[original_index]
+                    if original_index < len(COCO_BODY_KEYPOINT_NAMES)
+                    else f"keypoint_{original_index}",
+                    "x": float(coords[0]),
+                    "y": float(coords[1]),
+                }
+                if len(keypoint) >= 3 and keypoint[2] is not None:
+                    try:
+                        score_val = float(keypoint[2])
+                    except (TypeError, ValueError):
+                        score_val = None
+                    if score_val is not None:
+                        clipped_score = float(np.clip(score_val, 0.0, 1.0))
+                        entry["score"] = clipped_score
+                        entry["confidence"] = clipped_score
+                frame_points.append(entry)
+
+            if frame_points:
+                points_dict_list = frame_points
 
         pose_data = {
             "retarget_image": refer_img if retarget_image is not None else None,
