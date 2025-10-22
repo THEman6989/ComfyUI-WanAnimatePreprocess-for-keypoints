@@ -1,5 +1,6 @@
 import os
 import copy
+import math
 import torch
 from tqdm import tqdm
 import numpy as np
@@ -633,6 +634,31 @@ class PoseDataToOpenPose:
             openpose_kps.extend([float(x), float(y), float(c)])
         return openpose_kps
 
+    def _meta_to_openpose_frame(self, meta: Any, include_face: bool, include_hands: bool, frame_index: int) -> Dict[str, Any]:
+        width, height, body, lhand, rhand, face = self._meta_to_arrays(meta)
+
+        frame_entry: Dict[str, Any] = {
+            "version": 1.3,
+            "people": [
+                {
+                    "person_id": [-1],
+                    "pose_keypoints_2d": self._to_openpose_list(body, width, height),
+                    "pose_keypoints_3d": [],
+                    "face_keypoints_2d": self._to_openpose_list(face, width, height) if include_face else [],
+                    "face_keypoints_3d": [],
+                    "hand_left_keypoints_2d": self._to_openpose_list(lhand, width, height) if include_hands else [],
+                    "hand_left_keypoints_3d": [],
+                    "hand_right_keypoints_2d": self._to_openpose_list(rhand, width, height) if include_hands else [],
+                    "hand_right_keypoints_3d": [],
+                }
+            ],
+            "canvas_width": int(width),
+            "canvas_height": int(height),
+            "frame_index": int(frame_index),
+        }
+
+        return frame_entry
+
     def convert(self, pose_data, use_retarget_pose=False, include_face=True, include_hands=True):
         metas_source_key = "pose_metas" if use_retarget_pose else "pose_metas_original"
         metas: Iterable[Any] = pose_data.get(metas_source_key, [])
@@ -641,28 +667,7 @@ class PoseDataToOpenPose:
 
         openpose_frames: List[Dict[str, Any]] = []
         for idx, meta in enumerate(metas):
-            width, height, body, lhand, rhand, face = self._meta_to_arrays(meta)
-
-            frame_entry: Dict[str, Any] = {
-                "version": 1.3,
-                "people": [
-                    {
-                        "person_id": [-1],
-                        "pose_keypoints_2d": self._to_openpose_list(body, width, height),
-                        "pose_keypoints_3d": [],
-                        "face_keypoints_2d": self._to_openpose_list(face, width, height) if include_face else [],
-                        "face_keypoints_3d": [],
-                        "hand_left_keypoints_2d": self._to_openpose_list(lhand, width, height) if include_hands else [],
-                        "hand_left_keypoints_3d": [],
-                        "hand_right_keypoints_2d": self._to_openpose_list(rhand, width, height) if include_hands else [],
-                        "hand_right_keypoints_3d": [],
-                    }
-                ],
-                "canvas_width": width,
-                "canvas_height": height,
-                "frame_index": idx,
-            }
-
+            frame_entry = self._meta_to_openpose_frame(meta, include_face, include_hands, idx)
             openpose_frames.append(frame_entry)
 
         json_output = json.dumps(openpose_frames, ensure_ascii=False)
@@ -695,13 +700,13 @@ class PoseDataToOpenPoseKeypoints:
             }
         }
 
-    RETURN_TYPES = ("POSEKEYPOINTS", "POSEKEYPOINTS")
-    RETURN_NAMES = ("pose_keypoints", "pose_keypoints_all")
+    RETURN_TYPES = ("POSE_KEYPOINT", "POSE_KEYPOINT")
+    RETURN_NAMES = ("pose_keypoint", "pose_keypoint_sequence")
     FUNCTION = "convert"
     CATEGORY = "WanAnimatePreprocess"
     DESCRIPTION = (
-        "Extracts OpenPose-format pose keypoints (x, y, confidence) from stored pose metadata without wrapping them into JSON. "
-        "Returns the selected frame as well as the complete sequence."
+        "Converts stored pose metadata into POSE_KEYPOINT dictionaries compatible with the Ultimate OpenPose Editor, returning "
+        "both a selected frame and the entire sequence."
     )
 
     def convert(self, pose_data, use_retarget_pose=False, frame_index=0):
@@ -711,17 +716,18 @@ class PoseDataToOpenPoseKeypoints:
             metas = pose_data.get("pose_metas_original", [])
 
         converter = PoseDataToOpenPose()
-        all_keypoints: List[List[float]] = []
-        for meta in metas:
-            width, height, body, _, _, _ = converter._meta_to_arrays(meta)
-            all_keypoints.append(converter._to_openpose_list(body, width, height))
+        frames: List[Dict[str, Any]] = []
+        for idx, meta in enumerate(metas):
+            frame_entry = converter._meta_to_openpose_frame(meta, include_face=True, include_hands=True, frame_index=idx)
+            frames.append(frame_entry)
 
-        if not all_keypoints:
+        if not frames:
             return ([], [])
 
-        clamped_index = max(0, min(int(frame_index), len(all_keypoints) - 1))
-        selected = all_keypoints[clamped_index]
-        return (selected, all_keypoints)
+        clamped_index = max(0, min(int(frame_index), len(frames) - 1))
+        selected_frame = copy.deepcopy(frames[clamped_index])
+        full_sequence = copy.deepcopy(frames)
+        return (selected_frame, full_sequence)
 
 
 class KeyFrameBodyPointsManipulator:
@@ -889,16 +895,38 @@ class KeyFrameBodyPointsToOpenPoseKeypoints:
                         "tooltip": "Fallback confidence value applied when none is provided for a keypoint.",
                     },
                 ),
+                "canvas_width": (
+                    "INT",
+                    {
+                        "default": -1,
+                        "min": -1,
+                        "max": 16384,
+                        "step": 1,
+                        "tooltip": "Canvas width for the generated OpenPose frame. Set to -1 to infer from the data.",
+                    },
+                ),
+                "canvas_height": (
+                    "INT",
+                    {
+                        "default": -1,
+                        "min": -1,
+                        "max": 16384,
+                        "step": 1,
+                        "tooltip": "Canvas height for the generated OpenPose frame. Set to -1 to infer from the data.",
+                    },
+                ),
             },
         }
 
-    RETURN_TYPES = ("POSEKEYPOINTS",)
-    RETURN_NAMES = ("pose_keypoints",)
+    RETURN_TYPES = ("POSE_KEYPOINT",)
+    RETURN_NAMES = ("pose_keypoint",)
     FUNCTION = "convert"
     CATEGORY = "WanAnimatePreprocess"
-    DESCRIPTION = "Converts the compact key frame body point list into an OpenPose-style flat keypoint array (x, y, confidence)."
+    DESCRIPTION = (
+        "Converts key frame body points into an OpenPose POSE_KEYPOINT frame matching the Ultimate OpenPose Editor format."
+    )
 
-    def convert(self, key_frame_body_points, default_confidence=1.0):
+    def convert(self, key_frame_body_points, default_confidence=1.0, canvas_width=-1, canvas_height=-1):
         try:
             parsed = json.loads(key_frame_body_points)
         except (json.JSONDecodeError, TypeError):
@@ -910,12 +938,26 @@ class KeyFrameBodyPointsToOpenPoseKeypoints:
         else:
             points_iterable = parsed
 
-        openpose_keypoints: List[float] = []
-        for entry in points_iterable:
-            if not isinstance(entry, dict):
+        if not isinstance(points_iterable, list):
+            logging.warning("KeyFrameBodyPointsToOpenPoseKeypoints expected a list of points.")
+            return ([],)
+
+        indices_resolver = KeyFrameBodyPointsManipulator()
+        resolved_indices = indices_resolver._resolve_entry_indices(points_iterable)
+
+        body_keypoints = [0.0] * (len(COCO_BODY_KEYPOINT_NAMES) * 3)
+        xs: List[float] = []
+        ys: List[float] = []
+
+        for entry, body_index in zip(points_iterable, resolved_indices):
+            if body_index is None or not isinstance(entry, dict):
                 continue
-            x = float(entry.get("x", 0.0))
-            y = float(entry.get("y", 0.0))
+            try:
+                x = float(entry.get("x", 0.0))
+                y = float(entry.get("y", 0.0))
+            except (TypeError, ValueError):
+                continue
+
             confidence = entry.get("confidence")
             if confidence is None:
                 confidence = entry.get("score", default_confidence)
@@ -923,9 +965,51 @@ class KeyFrameBodyPointsToOpenPoseKeypoints:
                 c_val = float(confidence)
             except (TypeError, ValueError):
                 c_val = float(default_confidence)
-            openpose_keypoints.extend([x, y, c_val])
+            c_val = float(np.clip(c_val, 0.0, 1.0))
 
-        return (openpose_keypoints,)
+            slot = int(body_index) * 3
+            if 0 <= slot <= len(body_keypoints) - 3:
+                body_keypoints[slot] = x
+                body_keypoints[slot + 1] = y
+                body_keypoints[slot + 2] = c_val
+                xs.append(x)
+                ys.append(y)
+
+        if not xs and not ys:
+            return ([],)
+
+        def _resolve_canvas(value_list: List[float], provided: int) -> int:
+            if isinstance(provided, int) and provided > 0:
+                return provided
+            max_val = max(value_list) if value_list else 0.0
+            if max_val > 2.0:
+                return max(1, int(math.ceil(max_val)))
+            return 512
+
+        width = _resolve_canvas(xs, int(canvas_width) if canvas_width is not None else -1)
+        height = _resolve_canvas(ys, int(canvas_height) if canvas_height is not None else -1)
+
+        frame_entry = {
+            "version": 1.3,
+            "people": [
+                {
+                    "person_id": [-1],
+                    "pose_keypoints_2d": body_keypoints,
+                    "pose_keypoints_3d": [],
+                    "face_keypoints_2d": [],
+                    "face_keypoints_3d": [],
+                    "hand_left_keypoints_2d": [],
+                    "hand_left_keypoints_3d": [],
+                    "hand_right_keypoints_2d": [],
+                    "hand_right_keypoints_3d": [],
+                }
+            ],
+            "canvas_width": width,
+            "canvas_height": height,
+            "frame_index": 0,
+        }
+
+        return (frame_entry,)
 
 NODE_CLASS_MAPPINGS = {
     "OnnxDetectionModelLoader10": OnnxDetectionModelLoader,
