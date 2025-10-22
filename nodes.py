@@ -6,6 +6,7 @@ import folder_paths
 import cv2
 import json
 import logging
+from typing import Any, Dict, Iterable, List, Tuple, Union
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
 from comfy import model_management as mm
@@ -333,15 +334,124 @@ class PoseRetargetPromptHelper:
 
         return (tpl_prompt, refer_prompt, )
 
+
+class PoseDataToOpenPose:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "use_retarget_pose": ("BOOLEAN", {"default": False, "tooltip": "When true, convert the retargeted pose instead of the original detection."}),
+                "include_face": ("BOOLEAN", {"default": True, "tooltip": "Include face keypoints in the exported data."}),
+                "include_hands": ("BOOLEAN", {"default": True, "tooltip": "Include hand keypoints in the exported data."}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("openpose_json",)
+    FUNCTION = "convert"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "Converts pose data into the standard OpenPose JSON dictionary format."
+
+    def _meta_to_arrays(self, meta: Union[Dict[str, Any], AAPoseMeta]) -> Tuple[int, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        if isinstance(meta, AAPoseMeta):
+            width = int(meta.width)
+            height = int(meta.height)
+
+            def _combine(points: Union[np.ndarray, None], scores: Union[np.ndarray, None]) -> np.ndarray:
+                if points is None:
+                    return np.zeros((0, 3), dtype=np.float32)
+                points = np.asarray(points, dtype=np.float32)
+                if points.ndim != 2 or points.shape[1] != 2:
+                    return np.zeros((0, 3), dtype=np.float32)
+                if scores is None:
+                    scores_arr = np.ones(points.shape[0], dtype=np.float32)
+                else:
+                    scores_arr = np.asarray(scores, dtype=np.float32).reshape(-1)
+                    if scores_arr.shape[0] != points.shape[0]:
+                        scores_arr = np.ones(points.shape[0], dtype=np.float32)
+                return np.concatenate([points, scores_arr[:, None]], axis=1)
+
+            body = _combine(meta.kps_body, meta.kps_body_p)
+            lhand = _combine(meta.kps_lhand, meta.kps_lhand_p)
+            rhand = _combine(meta.kps_rhand, meta.kps_rhand_p)
+            face = _combine(meta.kps_face, meta.kps_face_p)
+        else:
+            width = int(meta["width"])
+            height = int(meta["height"])
+            body = np.asarray(meta.get("keypoints_body", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
+            lhand = np.asarray(meta.get("keypoints_left_hand", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
+            rhand = np.asarray(meta.get("keypoints_right_hand", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
+            face = np.asarray(meta.get("keypoints_face", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
+
+        return width, height, body, lhand, rhand, face
+
+    def _to_openpose_list(self, keypoints: np.ndarray, width: int, height: int) -> List[float]:
+        if keypoints.size == 0:
+            return []
+
+        coords = keypoints[:, :2]
+        conf = keypoints[:, 2] if keypoints.shape[1] > 2 else np.ones(keypoints.shape[0], dtype=np.float32)
+
+        max_coord = np.max(coords) if coords.size else 0
+        if max_coord <= 1.5:
+            xs = coords[:, 0] * width
+            ys = coords[:, 1] * height
+        else:
+            xs = coords[:, 0]
+            ys = coords[:, 1]
+
+        openpose_kps: List[float] = []
+        for x, y, c in zip(xs, ys, conf):
+            openpose_kps.extend([float(x), float(y), float(c)])
+        return openpose_kps
+
+    def convert(self, pose_data, use_retarget_pose=False, include_face=True, include_hands=True):
+        metas_source_key = "pose_metas" if use_retarget_pose else "pose_metas_original"
+        metas: Iterable[Any] = pose_data.get(metas_source_key, [])
+        if not metas:
+            metas = pose_data.get("pose_metas_original", [])
+
+        openpose_frames: List[Dict[str, Any]] = []
+        for idx, meta in enumerate(metas):
+            width, height, body, lhand, rhand, face = self._meta_to_arrays(meta)
+
+            frame_entry: Dict[str, Any] = {
+                "version": 1.3,
+                "people": [
+                    {
+                        "person_id": [-1],
+                        "pose_keypoints_2d": self._to_openpose_list(body, width, height),
+                        "pose_keypoints_3d": [],
+                        "face_keypoints_2d": self._to_openpose_list(face, width, height) if include_face else [],
+                        "face_keypoints_3d": [],
+                        "hand_left_keypoints_2d": self._to_openpose_list(lhand, width, height) if include_hands else [],
+                        "hand_left_keypoints_3d": [],
+                        "hand_right_keypoints_2d": self._to_openpose_list(rhand, width, height) if include_hands else [],
+                        "hand_right_keypoints_3d": [],
+                    }
+                ],
+                "canvas_width": width,
+                "canvas_height": height,
+                "frame_index": idx,
+            }
+
+            openpose_frames.append(frame_entry)
+
+        json_output = json.dumps(openpose_frames, ensure_ascii=False)
+        return (json_output,)
+
 NODE_CLASS_MAPPINGS = {
     "OnnxDetectionModelLoader": OnnxDetectionModelLoader,
     "PoseAndFaceDetection": PoseAndFaceDetection,
     "DrawViTPose": DrawViTPose,
     "PoseRetargetPromptHelper": PoseRetargetPromptHelper,
+    "PoseDataToOpenPose": PoseDataToOpenPose,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "OnnxDetectionModelLoader": "ONNX Detection Model Loader",
     "PoseAndFaceDetection": "Pose and Face Detection",
     "DrawViTPose": "Draw ViT Pose",
     "PoseRetargetPromptHelper": "Pose Retarget Prompt Helper",
+    "PoseDataToOpenPose": "Pose Data ➜ OpenPose JSON",
 }
