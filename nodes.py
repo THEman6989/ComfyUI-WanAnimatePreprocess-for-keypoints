@@ -398,6 +398,10 @@ class PoseDataManipulator:
         "shoulders": {"body": [5, 6]},
         "hands": {"body": [9, 10], "lhand": "all", "rhand": "all"},
         "arms": {"body": [5, 6, 7, 8, 9, 10]},
+        "body": {"body": "all"},
+        "head": {"body": [0, 1, 2, 3, 4], "face": "all"},
+        "face": {"face": "all"},
+        "full_body": {"body": "all", "lhand": "all", "rhand": "all", "face": "all"},
     }
 
     @classmethod
@@ -406,11 +410,11 @@ class PoseDataManipulator:
             "required": {
                 "pose_data": ("POSEDATA",),
                 "part": (list(cls.PART_DEFINITIONS.keys()), {"default": "feet"}),
-                "offset_x": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 1.0, "step": 0.01,
+                "offset_x": ("FLOAT", {"default": 0.0, "min": -1000.0, "max": 1000.0, "step": 0.01,
                                           "tooltip": "Horizontal offset applied to the selected keypoints (normalized)."}),
-                "offset_y": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 1.0, "step": 0.01,
+                "offset_y": ("FLOAT", {"default": 0.0, "min": -1000.0, "max": 1000.0, "step": 0.01,
                                           "tooltip": "Vertical offset applied to the selected keypoints (normalized)."}),
-                "scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 5.0, "step": 0.01,
+                "scale": ("FLOAT", {"default": 1.0, "min": -1000.0, "max": 1000.0, "step": 0.01,
                                        "tooltip": "Scale factor applied around the part centroid."}),
                 "confidence_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 5.0, "step": 0.01,
                                                   "tooltip": "Multiplier for confidence scores of the manipulated keypoints."}),
@@ -486,6 +490,12 @@ class PoseDataManipulator:
             self._transform_block(meta.kps_rhand, r_indices, meta.width, meta.height, offset_x, offset_y, scale, clamp)
             self._scale_confidences(meta.kps_rhand_p, r_indices, confidence_scale)
 
+        face_spec = part_map.get("face")
+        if meta.kps_face is not None and face_spec is not None:
+            f_indices = self._valid_indices(meta.kps_face.shape[0], face_spec)
+            self._transform_block(meta.kps_face, f_indices, meta.width, meta.height, offset_x, offset_y, scale, clamp)
+            self._scale_confidences(meta.kps_face_p, f_indices, confidence_scale)
+
     def _manipulate_dict_meta(self, meta: Dict[str, Any], part_map: Dict[str, Union[List[int], str]], offset_x: float,
                               offset_y: float, scale: float, confidence_scale: float, clamp: bool) -> None:
         if meta is None:
@@ -515,6 +525,7 @@ class PoseDataManipulator:
         transform_array("keypoints_body", part_map.get("body"))
         transform_array("keypoints_left_hand", part_map.get("lhand"))
         transform_array("keypoints_right_hand", part_map.get("rhand"))
+        transform_array("keypoints_face", part_map.get("face"))
 
     def _manipulate_meta(self, meta: Any, part_map: Dict[str, Union[List[int], str]], offset_x: float, offset_y: float,
                           scale: float, confidence_scale: float, clamp: bool) -> Any:
@@ -657,6 +668,265 @@ class PoseDataToOpenPose:
         json_output = json.dumps(openpose_frames, ensure_ascii=False)
         return (json_output,)
 
+
+class PoseDataToOpenPoseKeypoints:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "use_retarget_pose": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "When true, keypoints are taken from the retargeted pose meta list.",
+                    },
+                ),
+                "frame_index": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 4096,
+                        "step": 1,
+                        "tooltip": "Frame index to extract keypoints from. Clamped to the available range.",
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("POSEKEYPOINTS", "POSEKEYPOINTS")
+    RETURN_NAMES = ("pose_keypoints", "pose_keypoints_all")
+    FUNCTION = "convert"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = (
+        "Extracts OpenPose-format pose keypoints (x, y, confidence) from stored pose metadata without wrapping them into JSON. "
+        "Returns the selected frame as well as the complete sequence."
+    )
+
+    def convert(self, pose_data, use_retarget_pose=False, frame_index=0):
+        source_key = "pose_metas" if use_retarget_pose else "pose_metas_original"
+        metas: Iterable[Any] = pose_data.get(source_key, [])
+        if not metas:
+            metas = pose_data.get("pose_metas_original", [])
+
+        converter = PoseDataToOpenPose()
+        all_keypoints: List[List[float]] = []
+        for meta in metas:
+            width, height, body, _, _, _ = converter._meta_to_arrays(meta)
+            all_keypoints.append(converter._to_openpose_list(body, width, height))
+
+        if not all_keypoints:
+            return ([], [])
+
+        clamped_index = max(0, min(int(frame_index), len(all_keypoints) - 1))
+        selected = all_keypoints[clamped_index]
+        return (selected, all_keypoints)
+
+
+class KeyFrameBodyPointsManipulator:
+    PART_DEFINITIONS: Dict[str, Union[List[int], str]] = {
+        "feet": [15, 16],
+        "legs": [13, 14],
+        "full_legs": [11, 12, 13, 14, 15, 16],
+        "both_legs": [11, 12, 13, 14, 15, 16],
+        "torso": [5, 6, 11, 12],
+        "shoulders": [5, 6],
+        "hands": [9, 10],
+        "arms": [5, 6, 7, 8, 9, 10],
+        "body": list(range(len(COCO_BODY_KEYPOINT_NAMES))),
+        "head": [0, 1, 2, 3, 4],
+        "face": [0, 1, 2, 3, 4],
+        "full_body": list(range(len(COCO_BODY_KEYPOINT_NAMES))),
+    }
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "key_frame_body_points": (
+                    "STRING",
+                    {"tooltip": "Key frame body points JSON as emitted by Pose and Face Detection."},
+                ),
+                "part": (list(cls.PART_DEFINITIONS.keys()), {"default": "feet"}),
+                "offset_x": ("FLOAT", {"default": 0.0, "min": -1000.0, "max": 1000.0, "step": 0.01,
+                                          "tooltip": "Horizontal pixel offset for the selected keypoints."}),
+                "offset_y": ("FLOAT", {"default": 0.0, "min": -1000.0, "max": 1000.0, "step": 0.01,
+                                          "tooltip": "Vertical pixel offset for the selected keypoints."}),
+                "scale": ("FLOAT", {"default": 1.0, "min": -1000.0, "max": 1000.0, "step": 0.01,
+                                       "tooltip": "Scale factor applied around the centroid of the selected points."}),
+                "confidence_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 5.0, "step": 0.01,
+                                                  "tooltip": "Multiplier applied to score/confidence fields when available."}),
+                "clamp_to_positive": ("BOOLEAN", {"default": True,
+                                                    "tooltip": "Clamp manipulated coordinates to stay at or above zero."}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("key_frame_body_points",)
+    FUNCTION = "manipulate"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "Applies offsets and scaling to selected key frame body points such as legs, torso, or hands."
+
+    def _part_indices(self, part: str) -> List[int]:
+        spec = self.PART_DEFINITIONS.get(part, [])
+        if isinstance(spec, str):
+            if spec == "all":
+                return list(range(len(COCO_BODY_KEYPOINT_NAMES)))
+            return []
+        return list(spec)
+
+    def _resolve_entry_indices(self, entries: List[Dict[str, Any]]) -> List[Union[int, None]]:
+        fallback = KEY_FRAME_BODY_INDICES
+        if len(entries) == len(LEGACY_KEY_FRAME_BODY_INDICES):
+            fallback = LEGACY_KEY_FRAME_BODY_INDICES
+
+        resolved: List[Union[int, None]] = []
+        fallback_iter = iter(fallback)
+        for entry in entries:
+            idx = None
+            if isinstance(entry, dict):
+                candidate = entry.get("index")
+                if isinstance(candidate, int):
+                    idx = candidate
+            if idx is None:
+                idx = next(fallback_iter, None)
+            resolved.append(idx)
+        return resolved
+
+    def _collect_points(self, entries: List[Dict[str, Any]], indices: List[Union[int, None]],
+                         target: Iterable[int]) -> Tuple[List[int], np.ndarray]:
+        selected_indices: List[int] = []
+        coords: List[List[float]] = []
+        target_set = set(target)
+        for list_idx, (entry, original_idx) in enumerate(zip(entries, indices)):
+            if original_idx is None or original_idx not in target_set:
+                continue
+            try:
+                x = float(entry.get("x", 0.0))
+                y = float(entry.get("y", 0.0))
+            except (TypeError, ValueError):
+                continue
+            selected_indices.append(list_idx)
+            coords.append([x, y])
+        if not coords:
+            return [], np.zeros((0, 2), dtype=np.float32)
+        return selected_indices, np.asarray(coords, dtype=np.float32)
+
+    def _apply_confidence_scale(self, entry: Dict[str, Any], factor: float) -> None:
+        for key in ("confidence", "score"):
+            if key in entry:
+                try:
+                    value = float(entry[key]) * factor
+                except (TypeError, ValueError):
+                    continue
+                entry[key] = float(np.clip(value, 0.0, 1.0))
+
+    def manipulate(self, key_frame_body_points, part, offset_x, offset_y, scale, confidence_scale, clamp_to_positive=True):
+        try:
+            parsed = json.loads(key_frame_body_points)
+        except (json.JSONDecodeError, TypeError):
+            logging.warning("KeyFrameBodyPointsManipulator received invalid JSON payload.")
+            return (key_frame_body_points,)
+
+        if isinstance(parsed, dict):
+            entries = parsed.get("points", [])
+            container = parsed
+            use_dict = True
+        else:
+            entries = parsed
+            container = None
+            use_dict = False
+
+        if not isinstance(entries, list):
+            logging.warning("KeyFrameBodyPointsManipulator expected a list of points.")
+            return (key_frame_body_points,)
+
+        indices = self._resolve_entry_indices(entries)
+        target_indices = self._part_indices(part)
+        list_indices, coords = self._collect_points(entries, indices, target_indices)
+        if coords.size == 0:
+            return (key_frame_body_points,)
+
+        center = coords.mean(axis=0, keepdims=True)
+        transformed = (coords - center) * float(scale) + center
+        transformed[:, 0] += float(offset_x)
+        transformed[:, 1] += float(offset_y)
+        if clamp_to_positive:
+            transformed = np.clip(transformed, 0.0, None)
+
+        for idx, point in zip(list_indices, transformed):
+            entry = entries[idx]
+            entry["x"] = float(point[0])
+            entry["y"] = float(point[1])
+            if confidence_scale != 1.0:
+                self._apply_confidence_scale(entry, float(confidence_scale))
+
+        updated_payload = container if use_dict else entries
+        return (json.dumps(updated_payload),)
+
+
+class KeyFrameBodyPointsToOpenPoseKeypoints:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "key_frame_body_points": (
+                    "STRING",
+                    {
+                        "tooltip": "Key frame body points in JSON format as produced by Pose and Face Detection.",
+                    },
+                ),
+            },
+            "optional": {
+                "default_confidence": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "tooltip": "Fallback confidence value applied when none is provided for a keypoint.",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("POSEKEYPOINTS",)
+    RETURN_NAMES = ("pose_keypoints",)
+    FUNCTION = "convert"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "Converts the compact key frame body point list into an OpenPose-style flat keypoint array (x, y, confidence)."
+
+    def convert(self, key_frame_body_points, default_confidence=1.0):
+        try:
+            parsed = json.loads(key_frame_body_points)
+        except (json.JSONDecodeError, TypeError):
+            logging.warning("KeyFrameBodyPointsToOpenPoseKeypoints received invalid JSON payload.")
+            return ([],)
+
+        if isinstance(parsed, dict):
+            points_iterable = parsed.get("points", [])
+        else:
+            points_iterable = parsed
+
+        openpose_keypoints: List[float] = []
+        for entry in points_iterable:
+            if not isinstance(entry, dict):
+                continue
+            x = float(entry.get("x", 0.0))
+            y = float(entry.get("y", 0.0))
+            confidence = entry.get("confidence")
+            if confidence is None:
+                confidence = entry.get("score", default_confidence)
+            try:
+                c_val = float(confidence)
+            except (TypeError, ValueError):
+                c_val = float(default_confidence)
+            openpose_keypoints.extend([x, y, c_val])
+
+        return (openpose_keypoints,)
+
 NODE_CLASS_MAPPINGS = {
     "OnnxDetectionModelLoader10": OnnxDetectionModelLoader,
     "PoseAndFaceDetection10": PoseAndFaceDetection,
@@ -664,6 +934,9 @@ NODE_CLASS_MAPPINGS = {
     "PoseRetargetPromptHelper10": PoseRetargetPromptHelper,
     "PoseDataManipulator10": PoseDataManipulator,
     "PoseDataToOpenPose10": PoseDataToOpenPose,
+    "PoseDataToOpenPoseKeypoints10": PoseDataToOpenPoseKeypoints,
+    "KeyFrameBodyPointsManipulator10v2": KeyFrameBodyPointsManipulator,
+    "KeyFrameBodyPointsToOpenPoseKeypoints10": KeyFrameBodyPointsToOpenPoseKeypoints,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "OnnxDetectionModelLoader10": "ONNX Detection Model Loader 10",
@@ -672,4 +945,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseRetargetPromptHelper10": "Pose Retarget Prompt Helper 10",
     "PoseDataManipulator10": "Pose Data Manipulator 10",
     "PoseDataToOpenPose10": "Pose Data ➜ OpenPose JSON 10",
+    "PoseDataToOpenPoseKeypoints10": "Pose Data ➜ OpenPose Keypoints 10",
+    "KeyFrameBodyPointsManipulator10v2": "Key Frame Body Manipulator 10 v2",
+    "KeyFrameBodyPointsToOpenPoseKeypoints10": "Key Frame Body ➜ OpenPose Keypoints 10",
 }
