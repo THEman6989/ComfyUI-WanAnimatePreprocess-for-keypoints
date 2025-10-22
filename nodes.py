@@ -1,4 +1,5 @@
 import os
+import copy
 import torch
 from tqdm import tqdm
 import numpy as np
@@ -6,6 +7,7 @@ import folder_paths
 import cv2
 import json
 import logging
+from typing import Any, Dict, Iterable, List, Tuple, Union
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
 from comfy import model_management as mm
@@ -333,15 +335,289 @@ class PoseRetargetPromptHelper:
 
         return (tpl_prompt, refer_prompt, )
 
+
+class PoseDataManipulator:
+    PART_DEFINITIONS: Dict[str, Dict[str, Union[List[int], str]]] = {
+        "feet": {"body": [15, 16]},
+        "legs": {"body": [13, 14]},
+        "full_legs": {"body": [11, 12, 13, 14, 15, 16]},
+        "both_legs": {"body": [11, 12, 13, 14, 15, 16]},
+        "torso": {"body": [5, 6, 11, 12]},
+        "shoulders": {"body": [5, 6]},
+        "hands": {"body": [9, 10], "lhand": "all", "rhand": "all"},
+        "arms": {"body": [5, 6, 7, 8, 9, 10]},
+    }
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "part": (list(cls.PART_DEFINITIONS.keys()), {"default": "feet"}),
+                "offset_x": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 1.0, "step": 0.01,
+                                          "tooltip": "Horizontal offset applied to the selected keypoints (normalized)."}),
+                "offset_y": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 1.0, "step": 0.01,
+                                          "tooltip": "Vertical offset applied to the selected keypoints (normalized)."}),
+                "scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 5.0, "step": 0.01,
+                                       "tooltip": "Scale factor applied around the part centroid."}),
+                "confidence_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 5.0, "step": 0.01,
+                                                  "tooltip": "Multiplier for confidence scores of the manipulated keypoints."}),
+                "apply_to_retarget": ("BOOLEAN", {"default": True,
+                                                     "tooltip": "Apply manipulation to retargeted pose metas."}),
+                "apply_to_original": ("BOOLEAN", {"default": True,
+                                                     "tooltip": "Apply manipulation to original pose metas."}),
+                "apply_to_reference": ("BOOLEAN", {"default": False,
+                                                      "tooltip": "Apply manipulation to the reference pose meta if present."}),
+                "clamp_to_unit": ("BOOLEAN", {"default": True,
+                                                 "tooltip": "Clamp manipulated coordinates to the [0,1] range before rescaling."}),
+            },
+        }
+
+    RETURN_TYPES = ("POSEDATA",)
+    RETURN_NAMES = ("pose_data",)
+    FUNCTION = "manipulate"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "Manipulates sections of pose data such as legs, torso, or arms by applying offsets and scaling."
+
+    def _collect_indices(self, part: str) -> Dict[str, Union[List[int], str]]:
+        return self.PART_DEFINITIONS.get(part, {})
+
+    def _valid_indices(self, count: int, spec: Union[List[int], str]) -> List[int]:
+        if isinstance(spec, str):
+            if spec == "all":
+                return list(range(count))
+            return []
+        return [idx for idx in spec if isinstance(idx, int) and 0 <= idx < count]
+
+    def _transform_block(self, coords: np.ndarray, indices: List[int], width: float, height: float,
+                         offset_x: float, offset_y: float, scale: float, clamp: bool) -> None:
+        if coords is None or not indices:
+            return
+        width = max(float(width), 1.0)
+        height = max(float(height), 1.0)
+        selected = coords[indices].astype(np.float32)
+        if selected.size == 0:
+            return
+        norm = selected / np.array([width, height], dtype=np.float32)
+        center = norm.mean(axis=0, keepdims=True)
+        norm = (norm - center) * scale + center
+        norm[:, 0] += offset_x
+        norm[:, 1] += offset_y
+        if clamp:
+            norm = np.clip(norm, 0.0, 1.0)
+        coords[indices, 0] = norm[:, 0] * width
+        coords[indices, 1] = norm[:, 1] * height
+
+    def _scale_confidences(self, conf: np.ndarray, indices: List[int], factor: float) -> None:
+        if conf is None or not indices:
+            return
+        conf[indices] = np.clip(conf[indices] * factor, 0.0, 1.0)
+
+    def _manipulate_aapose(self, meta: AAPoseMeta, part_map: Dict[str, Union[List[int], str]], offset_x: float,
+                            offset_y: float, scale: float, confidence_scale: float, clamp: bool) -> None:
+        if meta is None:
+            return
+        body_indices = self._valid_indices(meta.kps_body.shape[0] if meta.kps_body is not None else 0,
+                                           part_map.get("body", []))
+        self._transform_block(meta.kps_body, body_indices, meta.width, meta.height, offset_x, offset_y, scale, clamp)
+        self._scale_confidences(meta.kps_body_p, body_indices, confidence_scale)
+
+        lhand_spec = part_map.get("lhand")
+        if meta.kps_lhand is not None and lhand_spec is not None:
+            l_indices = self._valid_indices(meta.kps_lhand.shape[0], lhand_spec)
+            self._transform_block(meta.kps_lhand, l_indices, meta.width, meta.height, offset_x, offset_y, scale, clamp)
+            self._scale_confidences(meta.kps_lhand_p, l_indices, confidence_scale)
+
+        rhand_spec = part_map.get("rhand")
+        if meta.kps_rhand is not None and rhand_spec is not None:
+            r_indices = self._valid_indices(meta.kps_rhand.shape[0], rhand_spec)
+            self._transform_block(meta.kps_rhand, r_indices, meta.width, meta.height, offset_x, offset_y, scale, clamp)
+            self._scale_confidences(meta.kps_rhand_p, r_indices, confidence_scale)
+
+    def _manipulate_dict_meta(self, meta: Dict[str, Any], part_map: Dict[str, Union[List[int], str]], offset_x: float,
+                              offset_y: float, scale: float, confidence_scale: float, clamp: bool) -> None:
+        if meta is None:
+            return
+        width = float(meta.get("width", 1.0))
+        height = float(meta.get("height", 1.0))
+
+        def transform_array(key: str, indices_spec: Union[List[int], str]):
+            if indices_spec is None:
+                return
+            arr = meta.get(key)
+            if arr is None:
+                return
+            arr_np = np.asarray(arr, dtype=np.float32)
+            if arr_np.ndim != 2 or arr_np.shape[1] < 2:
+                return
+            indices = self._valid_indices(arr_np.shape[0], indices_spec)
+            if not indices:
+                return
+            coords = arr_np[:, :2].copy()
+            self._transform_block(coords, indices, width, height, offset_x, offset_y, scale, clamp)
+            arr_np[indices, :2] = coords[indices]
+            if arr_np.shape[1] >= 3:
+                arr_np[indices, 2] = np.clip(arr_np[indices, 2] * confidence_scale, 0.0, 1.0)
+            meta[key] = arr_np
+
+        transform_array("keypoints_body", part_map.get("body"))
+        transform_array("keypoints_left_hand", part_map.get("lhand"))
+        transform_array("keypoints_right_hand", part_map.get("rhand"))
+
+    def _manipulate_meta(self, meta: Any, part_map: Dict[str, Union[List[int], str]], offset_x: float, offset_y: float,
+                          scale: float, confidence_scale: float, clamp: bool) -> Any:
+        if isinstance(meta, AAPoseMeta):
+            self._manipulate_aapose(meta, part_map, offset_x, offset_y, scale, confidence_scale, clamp)
+            return meta
+        if isinstance(meta, dict):
+            self._manipulate_dict_meta(meta, part_map, offset_x, offset_y, scale, confidence_scale, clamp)
+            return meta
+        return meta
+
+    def manipulate(self, pose_data, part, offset_x, offset_y, scale, confidence_scale,
+                   apply_to_retarget=True, apply_to_original=True, apply_to_reference=False, clamp_to_unit=True):
+        updated_pose_data = copy.deepcopy(pose_data)
+        part_map = self._collect_indices(part)
+
+        if apply_to_retarget:
+            metas = updated_pose_data.get("pose_metas", [])
+            for idx, meta in enumerate(metas):
+                metas[idx] = self._manipulate_meta(meta, part_map, offset_x, offset_y, scale, confidence_scale, clamp_to_unit)
+            updated_pose_data["pose_metas"] = metas
+
+        if apply_to_original:
+            metas = updated_pose_data.get("pose_metas_original", [])
+            for idx, meta in enumerate(metas):
+                metas[idx] = self._manipulate_meta(meta, part_map, offset_x, offset_y, scale, confidence_scale, clamp_to_unit)
+            updated_pose_data["pose_metas_original"] = metas
+
+        if apply_to_reference and updated_pose_data.get("refer_pose_meta") is not None:
+            updated_pose_data["refer_pose_meta"] = self._manipulate_meta(
+                updated_pose_data["refer_pose_meta"], part_map, offset_x, offset_y, scale, confidence_scale, clamp_to_unit
+            )
+
+        return (updated_pose_data,)
+
+
+class PoseDataToOpenPose:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_data": ("POSEDATA",),
+                "use_retarget_pose": ("BOOLEAN", {"default": False, "tooltip": "When true, convert the retargeted pose instead of the original detection."}),
+                "include_face": ("BOOLEAN", {"default": True, "tooltip": "Include face keypoints in the exported data."}),
+                "include_hands": ("BOOLEAN", {"default": True, "tooltip": "Include hand keypoints in the exported data."}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("openpose_json",)
+    FUNCTION = "convert"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "Converts pose data into the standard OpenPose JSON dictionary format."
+
+    def _meta_to_arrays(self, meta: Union[Dict[str, Any], AAPoseMeta]) -> Tuple[int, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        if isinstance(meta, AAPoseMeta):
+            width = int(meta.width)
+            height = int(meta.height)
+
+            def _combine(points: Union[np.ndarray, None], scores: Union[np.ndarray, None]) -> np.ndarray:
+                if points is None:
+                    return np.zeros((0, 3), dtype=np.float32)
+                points = np.asarray(points, dtype=np.float32)
+                if points.ndim != 2 or points.shape[1] != 2:
+                    return np.zeros((0, 3), dtype=np.float32)
+                if scores is None:
+                    scores_arr = np.ones(points.shape[0], dtype=np.float32)
+                else:
+                    scores_arr = np.asarray(scores, dtype=np.float32).reshape(-1)
+                    if scores_arr.shape[0] != points.shape[0]:
+                        scores_arr = np.ones(points.shape[0], dtype=np.float32)
+                return np.concatenate([points, scores_arr[:, None]], axis=1)
+
+            body = _combine(meta.kps_body, meta.kps_body_p)
+            lhand = _combine(meta.kps_lhand, meta.kps_lhand_p)
+            rhand = _combine(meta.kps_rhand, meta.kps_rhand_p)
+            face = _combine(meta.kps_face, meta.kps_face_p)
+        else:
+            width = int(meta["width"])
+            height = int(meta["height"])
+            body = np.asarray(meta.get("keypoints_body", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
+            lhand = np.asarray(meta.get("keypoints_left_hand", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
+            rhand = np.asarray(meta.get("keypoints_right_hand", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
+            face = np.asarray(meta.get("keypoints_face", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
+
+        return width, height, body, lhand, rhand, face
+
+    def _to_openpose_list(self, keypoints: np.ndarray, width: int, height: int) -> List[float]:
+        if keypoints.size == 0:
+            return []
+
+        coords = keypoints[:, :2]
+        conf = keypoints[:, 2] if keypoints.shape[1] > 2 else np.ones(keypoints.shape[0], dtype=np.float32)
+
+        max_coord = np.max(coords) if coords.size else 0
+        if max_coord <= 1.5:
+            xs = coords[:, 0] * width
+            ys = coords[:, 1] * height
+        else:
+            xs = coords[:, 0]
+            ys = coords[:, 1]
+
+        openpose_kps: List[float] = []
+        for x, y, c in zip(xs, ys, conf):
+            openpose_kps.extend([float(x), float(y), float(c)])
+        return openpose_kps
+
+    def convert(self, pose_data, use_retarget_pose=False, include_face=True, include_hands=True):
+        metas_source_key = "pose_metas" if use_retarget_pose else "pose_metas_original"
+        metas: Iterable[Any] = pose_data.get(metas_source_key, [])
+        if not metas:
+            metas = pose_data.get("pose_metas_original", [])
+
+        openpose_frames: List[Dict[str, Any]] = []
+        for idx, meta in enumerate(metas):
+            width, height, body, lhand, rhand, face = self._meta_to_arrays(meta)
+
+            frame_entry: Dict[str, Any] = {
+                "version": 1.3,
+                "people": [
+                    {
+                        "person_id": [-1],
+                        "pose_keypoints_2d": self._to_openpose_list(body, width, height),
+                        "pose_keypoints_3d": [],
+                        "face_keypoints_2d": self._to_openpose_list(face, width, height) if include_face else [],
+                        "face_keypoints_3d": [],
+                        "hand_left_keypoints_2d": self._to_openpose_list(lhand, width, height) if include_hands else [],
+                        "hand_left_keypoints_3d": [],
+                        "hand_right_keypoints_2d": self._to_openpose_list(rhand, width, height) if include_hands else [],
+                        "hand_right_keypoints_3d": [],
+                    }
+                ],
+                "canvas_width": width,
+                "canvas_height": height,
+                "frame_index": idx,
+            }
+
+            openpose_frames.append(frame_entry)
+
+        json_output = json.dumps(openpose_frames, ensure_ascii=False)
+        return (json_output,)
+
 NODE_CLASS_MAPPINGS = {
-    "OnnxDetectionModelLoader": OnnxDetectionModelLoader,
-    "PoseAndFaceDetection": PoseAndFaceDetection,
-    "DrawViTPose": DrawViTPose,
-    "PoseRetargetPromptHelper": PoseRetargetPromptHelper,
+    "OnnxDetectionModelLoader10": OnnxDetectionModelLoader,
+    "PoseAndFaceDetection10": PoseAndFaceDetection,
+    "DrawViTPose10": DrawViTPose,
+    "PoseRetargetPromptHelper10": PoseRetargetPromptHelper,
+    "PoseDataManipulator10": PoseDataManipulator,
+    "PoseDataToOpenPose10": PoseDataToOpenPose,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "OnnxDetectionModelLoader": "ONNX Detection Model Loader",
-    "PoseAndFaceDetection": "Pose and Face Detection",
-    "DrawViTPose": "Draw ViT Pose",
-    "PoseRetargetPromptHelper": "Pose Retarget Prompt Helper",
+    "OnnxDetectionModelLoader10": "ONNX Detection Model Loader 10",
+    "PoseAndFaceDetection10": "Pose and Face Detection 10",
+    "DrawViTPose10": "Draw ViT Pose 10",
+    "PoseRetargetPromptHelper10": "Pose Retarget Prompt Helper 10",
+    "PoseDataManipulator10": "Pose Data Manipulator 10",
+    "PoseDataToOpenPose10": "Pose Data ➜ OpenPose JSON 10",
 }
