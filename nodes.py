@@ -392,7 +392,7 @@ class PoseRetargetPromptHelper:
 class PoseDataManipulator:
     PART_DEFINITIONS: Dict[str, Dict[str, Union[List[int], str]]] = {
         "feet": {"body": [15, 16]},
-        "legs": {"body": [13, 14]},
+        "Only Legs": {"body": [13, 14, 15, 16], "special": "only_legs"},
         "full_legs": {"body": [11, 12, 13, 14, 15, 16]},
         "both_legs": {"body": [11, 12, 13, 14, 15, 16]},
         "torso": {"body": [5, 6, 11, 12]},
@@ -404,19 +404,43 @@ class PoseDataManipulator:
         "face": {"face": "all"},
         "full_body": {"body": "all", "lhand": "all", "rhand": "all", "face": "all"},
     }
+    PART_ALIASES: Dict[str, str] = {
+        "legs": "Only Legs",
+        "only_legs": "Only Legs",
+        "Only_Legs": "Only Legs",
+    }
+
+    @classmethod
+    def _part_choices(cls) -> List[str]:
+        return list(cls.PART_DEFINITIONS.keys())
+
+    def _resolve_part(self, part: str) -> Tuple[str, Union[List[int], str, Dict[str, Any]]]:
+        canonical = self.PART_ALIASES.get(part, part)
+        spec = self.PART_DEFINITIONS.get(canonical)
+        if spec is None and canonical != part:
+            spec = self.PART_DEFINITIONS.get(part)
+            if spec is not None:
+                canonical = part
+        if spec is None:
+            spec = []
+        return canonical, spec
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "pose_data": ("POSEDATA",),
-                "part": (list(cls.PART_DEFINITIONS.keys()), {"default": "feet"}),
+                "part": (cls._part_choices(), {"default": "feet"}),
                 "offset_x": ("FLOAT", {"default": 0.0, "min": -1000.0, "max": 1000.0, "step": 0.01,
                                           "tooltip": "Horizontal offset applied to the selected keypoints (normalized)."}),
                 "offset_y": ("FLOAT", {"default": 0.0, "min": -1000.0, "max": 1000.0, "step": 0.01,
                                           "tooltip": "Vertical offset applied to the selected keypoints (normalized)."}),
                 "scale": ("FLOAT", {"default": 1.0, "min": -1000.0, "max": 1000.0, "step": 0.01,
                                        "tooltip": "Scale factor applied around the part centroid."}),
+                "leg_scale_bidirectional": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "When manipulating Only Legs, stretch equally above and below the leg center instead of downwards only.",
+                }),
                 "confidence_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 5.0, "step": 0.01,
                                                   "tooltip": "Multiplier for confidence scores of the manipulated keypoints."}),
                 "apply_to_retarget": ("BOOLEAN", {"default": True,
@@ -436,8 +460,10 @@ class PoseDataManipulator:
     CATEGORY = "WanAnimatePreprocess"
     DESCRIPTION = "Manipulates sections of pose data such as legs, torso, or arms by applying offsets and scaling."
 
-    def _collect_indices(self, part: str) -> Dict[str, Union[List[int], str]]:
-        return self.PART_DEFINITIONS.get(part, {})
+    def _collect_indices(self, part: str) -> Tuple[str, Dict[str, Union[List[int], str]]]:
+        canonical, spec = self._resolve_part(part)
+        mapping: Dict[str, Union[List[int], str]] = spec if isinstance(spec, dict) else {}
+        return canonical, mapping
 
     def _valid_indices(self, count: int, spec: Union[List[int], str]) -> List[int]:
         if isinstance(spec, str):
@@ -547,8 +573,101 @@ class PoseDataManipulator:
                 if isinstance(conf, np.ndarray):
                     conf[idx] = new_val
 
+    def _stretch_only_legs_aapose(self, meta: AAPoseMeta, offset_x: float, offset_y: float, scale: float,
+                                  clamp: bool, bidirectional: bool) -> List[int]:
+        coords = self._ensure_array(meta.kps_body)
+        if coords is None or coords.ndim != 2 or coords.shape[1] < 2:
+            return []
+
+        width = max(float(getattr(meta, "width", 1.0)), 1.0)
+        height = max(float(getattr(meta, "height", 1.0)), 1.0)
+        scale_val = float(scale)
+        if not math.isfinite(scale_val):
+            scale_val = 1.0
+
+        offset_px = float(offset_x) * width
+        offset_py = float(offset_y) * height
+
+        modified: List[int] = []
+
+        def valid_point(index: int) -> Optional[Tuple[float, float]]:
+            if not (0 <= index < coords.shape[0]):
+                return None
+            try:
+                x_val = float(coords[index, 0])
+                y_val = float(coords[index, 1])
+            except (TypeError, ValueError):
+                return None
+            if not (math.isfinite(x_val) and math.isfinite(y_val)):
+                return None
+            return x_val, y_val
+
+        leg_triplets = ((11, 13, 15), (12, 14, 16))
+
+        for hip_idx, knee_idx, ankle_idx in leg_triplets:
+            hip_point = valid_point(hip_idx)
+            if hip_point is None:
+                continue
+            hip_y = hip_point[1]
+
+            knee_point = valid_point(knee_idx)
+            ankle_point = valid_point(ankle_idx)
+
+            if not bidirectional and knee_point is None and ankle_point is None:
+                continue
+
+            target_indices: List[int] = []
+
+            if bidirectional:
+                if ankle_point is None:
+                    continue
+                center_y = (hip_y + ankle_point[1]) * 0.5
+                for idx in (hip_idx, knee_idx, ankle_idx):
+                    point = valid_point(idx)
+                    if point is None:
+                        continue
+                    new_y = center_y + (point[1] - center_y) * scale_val
+                    coords[idx, 1] = float(new_y)
+                    target_indices.append(idx)
+            else:
+                for idx, point in ((knee_idx, knee_point), (ankle_idx, ankle_point)):
+                    if point is None:
+                        continue
+                    new_y = hip_y + (point[1] - hip_y) * scale_val
+                    coords[idx, 1] = float(new_y)
+                    target_indices.append(idx)
+
+            modified.extend(target_indices)
+
+        if not modified and offset_px == 0.0 and offset_py == 0.0:
+            return []
+
+        unique_indices = sorted(set(modified))
+
+        if offset_px != 0.0 or offset_py != 0.0:
+            for idx in unique_indices:
+                try:
+                    coords[idx, 0] = float(coords[idx, 0]) + offset_px
+                    coords[idx, 1] = float(coords[idx, 1]) + offset_py
+                except (TypeError, ValueError):
+                    continue
+
+        if clamp and unique_indices:
+            for idx in unique_indices:
+                try:
+                    nx = float(coords[idx, 0]) / width
+                    ny = float(coords[idx, 1]) / height
+                except (TypeError, ValueError):
+                    continue
+                coords[idx, 0] = float(np.clip(nx, 0.0, 1.0) * width)
+                coords[idx, 1] = float(np.clip(ny, 0.0, 1.0) * height)
+
+        meta.kps_body = coords
+        return unique_indices
+
     def _manipulate_aapose(self, meta: AAPoseMeta, part_map: Dict[str, Union[List[int], str]], offset_x: float,
-                            offset_y: float, scale: float, confidence_scale: float, clamp: bool) -> None:
+                            offset_y: float, scale: float, confidence_scale: float, clamp: bool,
+                            bidirectional: bool) -> None:
         if meta is None:
             return
         meta.kps_body = self._ensure_array(meta.kps_body)
@@ -559,6 +678,11 @@ class PoseDataManipulator:
         meta.kps_rhand_p = self._ensure_array(meta.kps_rhand_p)
         meta.kps_face = self._ensure_array(meta.kps_face)
         meta.kps_face_p = self._ensure_array(meta.kps_face_p)
+
+        if part_map.get("special") == "only_legs":
+            modified = self._stretch_only_legs_aapose(meta, offset_x, offset_y, scale, clamp, bidirectional)
+            self._scale_confidences(meta.kps_body_p, modified, confidence_scale)
+            return
 
         body_indices = self._valid_indices(
             meta.kps_body.shape[0] if isinstance(meta.kps_body, np.ndarray) else 0,
@@ -585,12 +709,127 @@ class PoseDataManipulator:
             modified = self._transform_block(meta.kps_face, f_indices, meta.width, meta.height, offset_x, offset_y, scale, clamp)
             self._scale_confidences(meta.kps_face_p, modified, confidence_scale)
 
+    def _stretch_only_legs_dict(self, meta: Dict[str, Any], offset_x: float, offset_y: float, scale: float,
+                                confidence_scale: float, clamp: bool, bidirectional: bool) -> None:
+        arr = meta.get("keypoints_body")
+        if arr is None:
+            return
+
+        arr_np = np.asarray(arr)
+        if arr_np.ndim != 2 or arr_np.shape[1] < 2:
+            return
+
+        try:
+            arr_np = arr_np.astype(np.float32, copy=False)
+        except (TypeError, ValueError):
+            arr_np = arr_np.astype(np.float32)
+
+        width = max(float(meta.get("width", 1.0)), 1.0)
+        height = max(float(meta.get("height", 1.0)), 1.0)
+        scale_val = float(scale)
+        if not math.isfinite(scale_val):
+            scale_val = 1.0
+
+        offset_px = float(offset_x) * width
+        offset_py = float(offset_y) * height
+
+        modified: List[int] = []
+
+        def valid_point(index: int) -> Optional[Tuple[float, float]]:
+            if not (0 <= index < arr_np.shape[0]):
+                return None
+            try:
+                x_val = float(arr_np[index, 0])
+                y_val = float(arr_np[index, 1])
+            except (TypeError, ValueError):
+                return None
+            if not (math.isfinite(x_val) and math.isfinite(y_val)):
+                return None
+            return x_val, y_val
+
+        leg_triplets = ((11, 13, 15), (12, 14, 16))
+
+        for hip_idx, knee_idx, ankle_idx in leg_triplets:
+            hip_point = valid_point(hip_idx)
+            if hip_point is None:
+                continue
+            _, hip_y = hip_point
+            knee_point = valid_point(knee_idx)
+            ankle_point = valid_point(ankle_idx)
+
+            if not bidirectional and knee_point is None and ankle_point is None:
+                continue
+
+            target_indices: List[int] = []
+
+            if bidirectional:
+                if ankle_point is None:
+                    continue
+                center_y = (hip_y + ankle_point[1]) * 0.5
+                for idx in (hip_idx, knee_idx, ankle_idx):
+                    point = valid_point(idx)
+                    if point is None:
+                        continue
+                    new_y = center_y + (point[1] - center_y) * scale_val
+                    arr_np[idx, 1] = float(new_y)
+                    target_indices.append(idx)
+            else:
+                for idx, point in ((knee_idx, knee_point), (ankle_idx, ankle_point)):
+                    if point is None:
+                        continue
+                    new_y = hip_y + (point[1] - hip_y) * scale_val
+                    arr_np[idx, 1] = float(new_y)
+                    target_indices.append(idx)
+
+            modified.extend(target_indices)
+
+        if not modified and offset_px == 0.0 and offset_py == 0.0:
+            return
+
+        unique_indices = sorted(set(modified))
+
+        if offset_px != 0.0 or offset_py != 0.0:
+            for idx in unique_indices:
+                try:
+                    arr_np[idx, 0] = float(arr_np[idx, 0]) + offset_px
+                    arr_np[idx, 1] = float(arr_np[idx, 1]) + offset_py
+                except (TypeError, ValueError):
+                    continue
+
+        if clamp and unique_indices:
+            for idx in unique_indices:
+                try:
+                    nx = float(arr_np[idx, 0]) / width
+                    ny = float(arr_np[idx, 1]) / height
+                except (TypeError, ValueError):
+                    continue
+                arr_np[idx, 0] = float(np.clip(nx, 0.0, 1.0) * width)
+                arr_np[idx, 1] = float(np.clip(ny, 0.0, 1.0) * height)
+
+        if arr_np.shape[1] >= 3 and confidence_scale != 1.0 and unique_indices:
+            for idx in unique_indices:
+                try:
+                    score_val = float(arr_np[idx, 2])
+                except (TypeError, ValueError):
+                    continue
+                arr_np[idx, 2] = float(np.clip(score_val * confidence_scale, 0.0, 1.0))
+
+        if isinstance(arr, list):
+            meta["keypoints_body"] = arr_np.tolist()
+        else:
+            meta["keypoints_body"] = arr_np
+
     def _manipulate_dict_meta(self, meta: Dict[str, Any], part_map: Dict[str, Union[List[int], str]], offset_x: float,
-                              offset_y: float, scale: float, confidence_scale: float, clamp: bool) -> None:
+                              offset_y: float, scale: float, confidence_scale: float, clamp: bool,
+                              bidirectional: bool) -> None:
         if meta is None:
             return
         width = float(meta.get("width", 1.0))
         height = float(meta.get("height", 1.0))
+
+        if part_map.get("special") == "only_legs":
+            self._stretch_only_legs_dict(meta, offset_x, offset_y, scale, confidence_scale, clamp, bidirectional)
+            return
 
         def transform_array(key: str, indices_spec: Union[List[int], str]):
             if indices_spec is None:
@@ -625,16 +864,16 @@ class PoseDataManipulator:
         transform_array("keypoints_face", part_map.get("face"))
 
     def _manipulate_meta(self, meta: Any, part_map: Dict[str, Union[List[int], str]], offset_x: float, offset_y: float,
-                          scale: float, confidence_scale: float, clamp: bool) -> Any:
+                          scale: float, confidence_scale: float, clamp: bool, bidirectional: bool) -> Any:
         if isinstance(meta, AAPoseMeta):
-            self._manipulate_aapose(meta, part_map, offset_x, offset_y, scale, confidence_scale, clamp)
+            self._manipulate_aapose(meta, part_map, offset_x, offset_y, scale, confidence_scale, clamp, bidirectional)
             return meta
         if isinstance(meta, dict):
-            self._manipulate_dict_meta(meta, part_map, offset_x, offset_y, scale, confidence_scale, clamp)
+            self._manipulate_dict_meta(meta, part_map, offset_x, offset_y, scale, confidence_scale, clamp, bidirectional)
             return meta
         return meta
 
-    def manipulate(self, pose_data, part, offset_x, offset_y, scale, confidence_scale,
+    def manipulate(self, pose_data, part, offset_x, offset_y, scale, leg_scale_bidirectional, confidence_scale,
                    apply_to_retarget=True, apply_to_original=True, apply_to_reference=False, clamp_to_unit=True):
         updated_pose_data = dict(pose_data)
         if "pose_metas" in pose_data:
@@ -645,23 +884,49 @@ class PoseDataManipulator:
             ]
         if pose_data.get("refer_pose_meta") is not None:
             updated_pose_data["refer_pose_meta"] = self._clone_meta(pose_data.get("refer_pose_meta"))
-        part_map = self._collect_indices(part)
+        _, part_map = self._collect_indices(part)
+        use_bidirectional = bool(leg_scale_bidirectional) if part_map.get("special") == "only_legs" else False
 
         if apply_to_retarget:
             metas = updated_pose_data.get("pose_metas", [])
             for idx, meta in enumerate(metas):
-                metas[idx] = self._manipulate_meta(meta, part_map, offset_x, offset_y, scale, confidence_scale, clamp_to_unit)
+                metas[idx] = self._manipulate_meta(
+                    meta,
+                    part_map,
+                    offset_x,
+                    offset_y,
+                    scale,
+                    confidence_scale,
+                    clamp_to_unit,
+                    use_bidirectional,
+                )
             updated_pose_data["pose_metas"] = metas
 
         if apply_to_original:
             metas = updated_pose_data.get("pose_metas_original", [])
             for idx, meta in enumerate(metas):
-                metas[idx] = self._manipulate_meta(meta, part_map, offset_x, offset_y, scale, confidence_scale, clamp_to_unit)
+                metas[idx] = self._manipulate_meta(
+                    meta,
+                    part_map,
+                    offset_x,
+                    offset_y,
+                    scale,
+                    confidence_scale,
+                    clamp_to_unit,
+                    use_bidirectional,
+                )
             updated_pose_data["pose_metas_original"] = metas
 
         if apply_to_reference and updated_pose_data.get("refer_pose_meta") is not None:
             updated_pose_data["refer_pose_meta"] = self._manipulate_meta(
-                updated_pose_data["refer_pose_meta"], part_map, offset_x, offset_y, scale, confidence_scale, clamp_to_unit
+                updated_pose_data["refer_pose_meta"],
+                part_map,
+                offset_x,
+                offset_y,
+                scale,
+                confidence_scale,
+                clamp_to_unit,
+                use_bidirectional,
             )
 
         return (updated_pose_data,)
@@ -906,9 +1171,9 @@ class PoseDataToOpenPoseKeypoints:
 
 
 class KeyFrameBodyPointsManipulator:
-    PART_DEFINITIONS: Dict[str, Union[List[int], str]] = {
+    PART_DEFINITIONS: Dict[str, Union[List[int], str, Dict[str, Any]]] = {
         "feet": [15, 16],
-        "legs": [13, 14],
+        "Only Legs": {"indices": [13, 14, 15, 16], "special": "only_legs"},
         "full_legs": [11, 12, 13, 14, 15, 16],
         "both_legs": [11, 12, 13, 14, 15, 16],
         "torso": [5, 6, 11, 12],
@@ -920,6 +1185,15 @@ class KeyFrameBodyPointsManipulator:
         "face": [0, 1, 2, 3, 4],
         "full_body": list(range(len(COCO_BODY_KEYPOINT_NAMES))),
     }
+    PART_ALIASES: Dict[str, str] = {
+        "legs": "Only Legs",
+        "only_legs": "Only Legs",
+        "Only_Legs": "Only Legs",
+    }
+
+    @classmethod
+    def _part_choices(cls) -> List[str]:
+        return list(cls.PART_DEFINITIONS.keys())
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -929,13 +1203,17 @@ class KeyFrameBodyPointsManipulator:
                     "STRING",
                     {"tooltip": "Key frame body points JSON as emitted by Pose and Face Detection."},
                 ),
-                "part": (list(cls.PART_DEFINITIONS.keys()), {"default": "feet"}),
+                "part": (cls._part_choices(), {"default": "feet"}),
                 "offset_x": ("FLOAT", {"default": 0.0, "min": -1000.0, "max": 1000.0, "step": 0.01,
                                           "tooltip": "Horizontal pixel offset for the selected keypoints."}),
                 "offset_y": ("FLOAT", {"default": 0.0, "min": -1000.0, "max": 1000.0, "step": 0.01,
                                           "tooltip": "Vertical pixel offset for the selected keypoints."}),
                 "scale": ("FLOAT", {"default": 1.0, "min": -1000.0, "max": 1000.0, "step": 0.01,
                                        "tooltip": "Scale factor applied around the centroid of the selected points."}),
+                "leg_scale_bidirectional": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "When manipulating Only Legs, stretch equally above and below the leg center instead of downwards only.",
+                }),
                 "confidence_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 5.0, "step": 0.01,
                                                   "tooltip": "Multiplier applied to score/confidence fields when available."}),
                 "clamp_to_positive": ("BOOLEAN", {"default": True,
@@ -950,7 +1228,9 @@ class KeyFrameBodyPointsManipulator:
     DESCRIPTION = "Applies offsets and scaling to selected key frame body points such as legs, torso, or hands."
 
     def _part_indices(self, part: str) -> List[int]:
-        spec = self.PART_DEFINITIONS.get(part, [])
+        _, spec = self._resolve_part(part)
+        if isinstance(spec, dict):
+            spec = spec.get("indices", [])
         if isinstance(spec, str):
             if spec == "all":
                 return list(range(len(COCO_BODY_KEYPOINT_NAMES)))
@@ -1003,7 +1283,118 @@ class KeyFrameBodyPointsManipulator:
                     continue
                 entry[key] = float(np.clip(value, 0.0, 1.0))
 
-    def manipulate(self, key_frame_body_points, part, offset_x, offset_y, scale, confidence_scale, clamp_to_positive=True):
+    def _stretch_only_legs_entries(
+        self,
+        entries: List[Dict[str, Any]],
+        resolved_indices: List[Union[int, None]],
+        scale: float,
+        offset_x: float,
+        offset_y: float,
+        clamp_to_positive: bool,
+        bidirectional: bool,
+    ) -> List[int]:
+        index_lookup: Dict[int, int] = {}
+        for list_idx, body_idx in enumerate(resolved_indices):
+            if isinstance(body_idx, int):
+                index_lookup[body_idx] = list_idx
+
+        scale_val = float(scale)
+        if not math.isfinite(scale_val):
+            scale_val = 1.0
+        offset_x_val = float(offset_x)
+        offset_y_val = float(offset_y)
+
+        modified: List[int] = []
+
+        def point_for(list_index: int) -> Optional[Tuple[float, float]]:
+            if not (0 <= list_index < len(entries)):
+                return None
+            entry = entries[list_index]
+            if not isinstance(entry, dict):
+                return None
+            try:
+                x_val = float(entry.get("x", 0.0))
+                y_val = float(entry.get("y", 0.0))
+            except (TypeError, ValueError):
+                return None
+            if not (math.isfinite(x_val) and math.isfinite(y_val)):
+                return None
+            return x_val, y_val
+
+        leg_triplets = ((11, 13, 15), (12, 14, 16))
+
+        for hip_idx, knee_idx, ankle_idx in leg_triplets:
+            hip_entry_idx = index_lookup.get(hip_idx)
+            if hip_entry_idx is None:
+                continue
+            hip_point = point_for(hip_entry_idx)
+            if hip_point is None:
+                continue
+
+            knee_entry_idx = index_lookup.get(knee_idx)
+            ankle_entry_idx = index_lookup.get(ankle_idx)
+
+            if not bidirectional and knee_entry_idx is None and ankle_entry_idx is None:
+                continue
+
+            current_targets: List[int] = []
+
+            if bidirectional:
+                if ankle_entry_idx is None:
+                    continue
+                ankle_point = point_for(ankle_entry_idx)
+                if ankle_point is None:
+                    continue
+                center_y = (hip_point[1] + ankle_point[1]) * 0.5
+                for idx in (hip_entry_idx, knee_entry_idx, ankle_entry_idx):
+                    if idx is None:
+                        continue
+                    point = point_for(idx)
+                    if point is None:
+                        continue
+                    new_y = center_y + (point[1] - center_y) * scale_val
+                    entries[idx]["y"] = float(new_y)
+                    current_targets.append(idx)
+            else:
+                for idx in (knee_entry_idx, ankle_entry_idx):
+                    if idx is None:
+                        continue
+                    point = point_for(idx)
+                    if point is None:
+                        continue
+                    new_y = hip_point[1] + (point[1] - hip_point[1]) * scale_val
+                    entries[idx]["y"] = float(new_y)
+                    current_targets.append(idx)
+
+            modified.extend(current_targets)
+
+        if not modified and offset_x_val == 0.0 and offset_y_val == 0.0:
+            return []
+
+        unique_indices = sorted(set(modified))
+
+        if offset_x_val != 0.0 or offset_y_val != 0.0:
+            for idx in unique_indices:
+                entry = entries[idx]
+                try:
+                    entry["x"] = float(entry.get("x", 0.0)) + offset_x_val
+                    entry["y"] = float(entry.get("y", 0.0)) + offset_y_val
+                except (TypeError, ValueError):
+                    continue
+
+        if clamp_to_positive and unique_indices:
+            for idx in unique_indices:
+                entry = entries[idx]
+                try:
+                    entry["x"] = float(max(0.0, entry.get("x", 0.0)))
+                    entry["y"] = float(max(0.0, entry.get("y", 0.0)))
+                except (TypeError, ValueError):
+                    continue
+
+        return unique_indices
+
+    def manipulate(self, key_frame_body_points, part, offset_x, offset_y, scale,
+                   leg_scale_bidirectional, confidence_scale, clamp_to_positive=True):
         try:
             parsed = json.loads(key_frame_body_points)
         except (json.JSONDecodeError, TypeError):
@@ -1024,6 +1415,29 @@ class KeyFrameBodyPointsManipulator:
             return (key_frame_body_points,)
 
         indices = self._resolve_entry_indices(entries)
+        _, part_spec = self._resolve_part(part)
+        special = part_spec.get("special") if isinstance(part_spec, dict) else None
+
+        if special == "only_legs":
+            modified_entries = self._stretch_only_legs_entries(
+                entries,
+                indices,
+                float(scale),
+                float(offset_x),
+                float(offset_y),
+                bool(clamp_to_positive),
+                bool(leg_scale_bidirectional),
+            )
+            if modified_entries and float(confidence_scale) != 1.0:
+                factor = float(confidence_scale)
+                for idx in modified_entries:
+                    if 0 <= idx < len(entries):
+                        entry = entries[idx]
+                        if isinstance(entry, dict):
+                            self._apply_confidence_scale(entry, factor)
+            updated_payload = container if use_dict else entries
+            return (json.dumps(updated_payload),)
+
         target_indices = self._part_indices(part)
         list_indices, coords = self._collect_points(entries, indices, target_indices)
         if coords.size == 0:
