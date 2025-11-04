@@ -5340,9 +5340,8 @@ class PoseDataEditorCutter:
         min_crop_h = float(min_crop_height)
         if min_crop_size is not None:
             legacy_w, legacy_h = self._vec2_to_pair(min_crop_size)
-            if legacy_w != 0.0 or legacy_h != 0.0:
-                min_crop_w = float(legacy_w)
-                min_crop_h = float(legacy_h)
+            min_crop_w = float(legacy_w)
+            min_crop_h = float(legacy_h)
 
         crop_bounds = self._determine_crop_bounds(
             pose_metas,
@@ -5844,9 +5843,8 @@ class PoseDataEditorWithMaskCutter(PoseDataEditorCutter):
         min_crop_h = float(min_crop_height)
         if min_crop_size is not None:
             legacy_w, legacy_h = self._vec2_to_pair(min_crop_size)
-            if legacy_w != 0.0 or legacy_h != 0.0:
-                min_crop_w = float(legacy_w)
-                min_crop_h = float(legacy_h)
+            min_crop_w = float(legacy_w)
+            min_crop_h = float(legacy_h)
 
         current_width = x1 - x0
         current_height = y1 - y0
