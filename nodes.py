@@ -92,142 +92,135 @@ class KeypointTrimNode:
             "required": {
                 "images": ("IMAGE",),
                 "pose_data": ("POSEDATA",),
-                "trim_start": ("BOOLEAN", {"default": True, "tooltip": "Remove frames at the beginning before the first keypoint appears."}),
-                "trim_end": ("BOOLEAN", {"default": False, "tooltip": "Remove frames at the end after the last keypoint disappears."}),
-                "fps": ("INT", {"default": 30, "min": 1, "max": 960, "step": 1, "tooltip": "Frame rate needed to calculate exact audio trim timing."}),
+                "trim_start": ("BOOLEAN", {"default": True, "tooltip": "Schneidet den Anfang weg, bevor der erste Keypoint auftaucht."}),
+                "trim_end": ("BOOLEAN", {"default": False, "tooltip": "Schneidet das Ende weg, nachdem der letzte Keypoint verschwindet."}),
+                "fps": ("INT", {"default": 30, "min": 1, "max": 960, "step": 1, "tooltip": "Wichtig für korrekten Audio-Schnitt."}),
             },
             "optional": {
                 "audio": ("AUDIO",),
                 "face_images": ("IMAGE",),
+                "optional_images": ("IMAGE", {"tooltip": "Zweiter Bild-Input zum Mit-Schneiden (z.B. Masken oder Pose-Bilder)."}),
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "POSEDATA", "AUDIO", "IMAGE", "INT", "INT")
-    RETURN_NAMES = ("images", "pose_data", "audio", "face_images", "start_frame", "end_frame")
+    RETURN_TYPES = ("IMAGE", "POSEDATA", "AUDIO", "IMAGE", "IMAGE", "INT", "INT")
+    RETURN_NAMES = ("images", "pose_data", "audio", "face_images", "optional_images", "start_frame", "end_frame")
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess"
     DESCRIPTION = "Trims video, audio, and pose data based on the presence of detected keypoints."
 
-    def process(self, images, pose_data, trim_start, trim_end, fps, audio=None, face_images=None):
-        # 1. Prepare Data
+    def process(self, images, pose_data, trim_start, trim_end, fps, audio=None, face_images=None, optional_images=None):
+        # 1. Daten vorbereiten
         pose_data_copy = copy.deepcopy(pose_data)
         pose_metas = pose_data_copy.get("pose_metas", [])
         
+        # Sicherheitscheck
         if not pose_metas:
-            # Fallback if no data
-            return (images, pose_data, audio, face_images, 0, len(images))
+            print("KeypointTrim: Keine Pose-Daten gefunden.")
+            return (images, pose_data, audio, face_images, optional_images, 0, len(images))
 
         total_frames = len(pose_metas)
         
-        # 2. Analyze Keypoints to find valid range
+        # 2. Keypoints analysieren
         first_valid_idx = 0
         last_valid_idx = total_frames - 1
         
-        # Helper to check if a frame has ANY valid keypoints
         def has_keypoints(meta):
             if not meta: return False
-            # Check Body
-            if hasattr(meta, "kps_body_p") and meta.kps_body_p is not None:
-                if np.any(meta.kps_body_p > 0.05): return True
-            # Check Hands (optional, depends on model)
-            if hasattr(meta, "kps_lhand_p") and meta.kps_lhand_p is not None:
-                if np.any(meta.kps_lhand_p > 0.05): return True
-            if hasattr(meta, "kps_rhand_p") and meta.kps_rhand_p is not None:
-                if np.any(meta.kps_rhand_p > 0.05): return True
-            # Check Face
-            if hasattr(meta, "kps_face_p") and meta.kps_face_p is not None:
-                if np.any(meta.kps_face_p > 0.05): return True
+            # Prüfe Body, Hands, Face auf Existenz und Score > 0.05
+            for attr in ["kps_body_p", "kps_lhand_p", "kps_rhand_p", "kps_face_p"]:
+                if hasattr(meta, attr):
+                    val = getattr(meta, attr)
+                    if val is not None and np.any(val > 0.05):
+                        return True
             return False
 
-        # Find Start
+        # Start finden
         if trim_start:
             for i in range(total_frames):
                 if has_keypoints(pose_metas[i]):
                     first_valid_idx = i
                     break
         
-        # Find End
+        # Ende finden
         if trim_end:
             for i in range(total_frames - 1, -1, -1):
                 if has_keypoints(pose_metas[i]):
                     last_valid_idx = i
                     break
         
-        # Safety: If nothing found, return nothing or single frame? 
-        # Here we enforce valid range logic
+        # Logik-Check: Wurde überhaupt etwas gefunden?
         if first_valid_idx > last_valid_idx:
-            # No valid keypoints found in entire sequence
-            print("KeypointTrimNode: No valid keypoints found. Outputting empty/black.")
-            # Return essentially empty/black
+            print("KeypointTrim: WARNUNG - Keine Keypoints im gesamten Video gefunden! Gebe leeres Ergebnis zurück.")
             first_valid_idx = 0
             last_valid_idx = 0 
 
-        # Calculate cut length (exclusive upper bound for python slicing)
+        # Python Slicing ist exklusiv am Ende, daher +1
         cut_end = last_valid_idx + 1
+        
+        # Info-Ausgabe in die Konsole
+        print(f"KeypointTrim: Schneide von Frame {first_valid_idx} bis {cut_end}. (Behalte {cut_end - first_valid_idx} Frames)")
 
-        print(f"KeypointTrim: Keeping frames {first_valid_idx} to {cut_end} (Total: {cut_end - first_valid_idx})")
-
-        # 3. Trim Images (Frames)
-        # Ensure images length matches pose data roughly to avoid index errors
+        # 3. Images schneiden (Haupt-Video)
+        # Wir clippen die Indices, damit sie nicht abstürzen, falls Images kürzer/länger als PoseData sind
         img_len = images.shape[0]
-        start_clamp = min(first_valid_idx, img_len)
-        end_clamp = min(cut_end, img_len)
-        trimmed_images = images[start_clamp:end_clamp]
+        i_start = min(first_valid_idx, img_len)
+        i_end = min(cut_end, img_len)
+        
+        trimmed_images = images[i_start:i_end]
 
-        # 4. Trim Pose Data
+        # 4. Pose Data schneiden
         pose_data_copy["pose_metas"] = pose_metas[first_valid_idx:cut_end]
         if "pose_metas_original" in pose_data_copy:
              pose_data_copy["pose_metas_original"] = pose_data_copy["pose_metas_original"][first_valid_idx:cut_end]
 
-        # 5. Trim Face Images (if present)
+        # 5. Face Images schneiden
         trimmed_face_images = None
         if face_images is not None:
-            # Face images might be a list or tensor
-            if isinstance(face_images, list):
+            if isinstance(face_images, list): # Falls es eine Liste ist
                 f_len = len(face_images)
-                f_start = min(first_valid_idx, f_len)
-                f_end = min(cut_end, f_len)
-                trimmed_face_images = face_images[f_start:f_end]
-            else:
-                # Tensor
+                trimmed_face_images = face_images[min(first_valid_idx, f_len):min(cut_end, f_len)]
+            else: # Falls es ein Tensor ist
                 f_len = face_images.shape[0]
-                f_start = min(first_valid_idx, f_len)
-                f_end = min(cut_end, f_len)
-                trimmed_face_images = face_images[f_start:f_end]
+                trimmed_face_images = face_images[min(first_valid_idx, f_len):min(cut_end, f_len)]
 
-        # 6. Trim Audio (if present)
+        # 6. Optional Images schneiden
+        trimmed_optional = None
+        if optional_images is not None:
+            o_len = optional_images.shape[0]
+            trimmed_optional = optional_images[min(first_valid_idx, o_len):min(cut_end, o_len)]
+
+        # 7. Audio schneiden
         trimmed_audio = None
         if audio is not None:
-            # Audio structure: {'waveform': tensor[1, channels, samples], 'sample_rate': int}
             try:
                 waveform = audio['waveform']
                 sample_rate = audio['sample_rate']
                 
-                # Calculate time stamps
+                # Zeit berechnen
                 start_time = first_valid_idx / float(fps)
-                # End time is based on the LAST frame index + 1 (duration)
+                # End time based on duration frames
                 end_time = cut_end / float(fps) 
                 
-                # Calculate sample indices
+                # Samples berechnen
                 start_sample = int(start_time * sample_rate)
                 end_sample = int(end_time * sample_rate)
                 
-                # Slice waveform (assume [Batch, Channel, Samples] or [Channel, Samples])
+                # Waveform schneiden
                 if waveform.ndim == 3:
                     new_waveform = waveform[:, :, start_sample:end_sample]
                 elif waveform.ndim == 2:
                     new_waveform = waveform[:, start_sample:end_sample]
                 else:
-                    new_waveform = waveform # Unknown format, skip
+                    new_waveform = waveform 
                 
                 trimmed_audio = {'waveform': new_waveform, 'sample_rate': sample_rate}
-                print(f"KeypointTrim: Audio trimmed from {start_time:.2f}s to {end_time:.2f}s")
                 
             except Exception as e:
-                print(f"KeypointTrim: Error trimming audio: {e}")
-                trimmed_audio = audio # Fallback to original
+                print(f"KeypointTrim: Audio Error: {e}")
+                trimmed_audio = audio
 
-        return (trimmed_images, pose_data_copy, trimmed_audio, trimmed_face_images, first_valid_idx, last_valid_idx)
+        return (trimmed_images, pose_data_copy, trimmed_audio, trimmed_face_images, trimmed_optional, first_valid_idx, last_valid_idx)
 
 # --------------------------------------------------------------------------------
 # NEW NODES: Wan Face Extractor & Stitcher (Hybrid: Batch Padded or List)
@@ -11228,6 +11221,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataAutoBlackoutOnJitter": "Auto Blackout On Jitter",
     
 }
+
 
 
 
