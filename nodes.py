@@ -12062,7 +12062,7 @@ NODE_CLASS_MAPPINGS = {
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseAndFaceDetectionV3": "Pose and Face Detection V3 (Champion Aspect)",
-    "WanFaceStitcherV3": "Wan Face Stitcher V3 (Smart Scale)"
+    "WanFaceStitcherV3": "Wan Face Stitcher V3 (Smart Scale)",
     "WanFaceExtractorV2": "Wan Face Extractor V2 (Champion Based)",
     "WanFaceStitcherV2": "Wan Face Stitcher V2 (Smart Scale)",
     "KeypointTrimNode": "Keypoint Trim (Video/Audio)",
@@ -12107,6 +12107,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataAutoBlackoutOnJitter": "Auto Blackout On Jitter",
     
 }
+
 
 
 
