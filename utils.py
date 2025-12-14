@@ -41,13 +41,22 @@ def get_mask_body_img(img_copy, hand_mask, k=7, iterations=1):
     return mask_hand_img, dilation
 
 
-def get_face_bboxes(kp2ds, scale, image_shape, ratio_aug):
+def get_face_bboxes(kp2ds, scale, image_shape, ratio_aug=False):
     h, w = image_shape
+    # Hinweis: kp2ds[23:91] schneidet hier Teile des Gesichtsarrays weg, wenn kp2ds
+    # bereits nur das Gesicht ist. Das führt zu einer Box basierend auf Augen/Nase/Mund.
+    # Durch den 'scale' Faktor wird das meist ausgeglichen.
     kp2ds_face = kp2ds.copy()[23:91, :2]
+
+    if kp2ds_face.shape[0] == 0:
+        # Fallback falls das Array leer ist oder slicing fehlschlägt
+        kp2ds_face = kp2ds.copy()
+
+    if kp2ds_face.shape[0] == 0:
+         return [0, 0, 0, 0]
 
     min_x, min_y = np.min(kp2ds_face, axis=0)
     max_x, max_y = np.max(kp2ds_face, axis=0)
-
 
     initial_width = max_x - min_x
     initial_height = max_y - min_y
@@ -55,6 +64,9 @@ def get_face_bboxes(kp2ds, scale, image_shape, ratio_aug):
     initial_area = initial_width * initial_height
 
     expanded_area = initial_area * scale
+
+    if initial_height == 0 or initial_width == 0:
+         return [int(min_x), int(max_x), int(min_y), int(max_y)]
 
     new_width = np.sqrt(expanded_area * (initial_width / initial_height))
     new_height = np.sqrt(expanded_area * (initial_height / initial_width))
@@ -287,31 +299,3 @@ def get_frame_indices(frame_num, video_fps, clip_length, train_fps):
     frame_indices = np.clip(frame_indices, 0, frame_num - 1)
 
     return frame_indices.tolist()
-
-
-def get_face_bboxes(kp2ds, scale, image_shape):
-    h, w = image_shape
-    kp2ds_face = kp2ds.copy()[1:] * (w, h)
-
-    min_x, min_y = np.min(kp2ds_face, axis=0)
-    max_x, max_y = np.max(kp2ds_face, axis=0)
-
-    initial_width = max_x - min_x
-    initial_height = max_y - min_y
-
-    initial_area = initial_width * initial_height
-
-    expanded_area = initial_area * scale
-
-    new_width = np.sqrt(expanded_area * (initial_width / initial_height))
-    new_height = np.sqrt(expanded_area * (initial_height / initial_width))
-
-    delta_width = (new_width - initial_width) / 2
-    delta_height = (new_height - initial_height) / 4
-
-    expanded_min_x = max(min_x - delta_width, 0)
-    expanded_max_x = min(max_x + delta_width, w)
-    expanded_min_y = max(min_y - 3 * delta_height, 0)
-    expanded_max_y = min(max_y + delta_height, h)
-
-    return [int(expanded_min_x), int(expanded_max_x), int(expanded_min_y), int(expanded_max_y)]
