@@ -85,6 +85,392 @@ FULL_BODY_LENGTH_PAIRS = TORSO_LENGTH_PAIRS + [
     (12, 13),  # left knee to left ankle
 ]
 
+# ==============================================================================
+# WanFace V2 Nodes - "Champion Based High-Fidelity Processing"
+# ==============================================================================
+
+class WanFaceExtractorV2:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("POSEMODEL",),
+                "images": ("IMAGE",),
+                "detector_resolution": ("INT", {"default": 640, "min": 320, "max": 1280, "step": 32, "tooltip": "Auflösung für die Gesichtserkennung (YOLO). Höher = mehr kleine Gesichter, aber langsamer."}),
+                "face_pad_factor": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 2.0, "step": 0.05, "tooltip": "Zusätzlicher Rand um das Gesicht (Faktor der BBox-Größe)."}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "FACE_INFO")
+    RETURN_NAMES = ("face_images", "face_info")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = (
+        "V2 Extractor: Analyzes ALL frames first to find the largest 'Champion' face. "
+        "Extracts all faces using the Champion's aspect ratio and upscales them "
+        "to the Champion's resolution to preserve maximum detail."
+    )
+
+    def process(self, model, images, detector_resolution, face_pad_factor):
+        detector = model["yolo"]
+        
+        # --- PASS 1: Detection & Champion Finding ---
+        # Wir sammeln erst alle Bounding Boxes, ohne zu croppen.
+        
+        images_np = images.cpu().numpy()
+        batch_size, img_h, img_w, _ = images_np.shape
+        
+        all_bboxes = [] # Liste von (x, y, w, h) oder None
+        max_area = 0
+        champion_size = (512, 512) # Fallback
+        champion_aspect = 1.0
+        found_any_face = False
+
+        detector.reinit()
+        
+        # Detection Loop
+        for i in tqdm(range(batch_size), desc="FaceV2: Analyzing"):
+            img = images_np[i]
+            # YOLO erwartet (1, 3, H, W) und shape info
+            shape_tensor = np.array([img_h, img_w])[None]
+            inp_img = cv2.resize(img, (detector_resolution, detector_resolution))
+            inp_img = inp_img.transpose(2, 0, 1)[None] # HWC -> CHW -> BCHW
+            
+            det_result = detector(inp_img, shape_tensor)
+            
+            # Ergebnis parsen (wir nehmen das größte Gesicht im Frame)
+            # YOLO liefert [[x1, y1, x2, y2, score, cls], ...]
+            # Die Helper-Funktion post-processed das schon, aber wir greifen hier direkt drauf zu wenn möglich
+            # oder nutzen das format vom wrapper. 
+            # Im Wrapper code gibt process_results eine Liste von dicts zurück: [{'bbox': [x,y,w,h, score], ...}]
+            
+            if det_result is None or len(det_result) == 0:
+                all_bboxes.append(None)
+                continue
+                
+            # Wir nehmen an, det_result[0] ist die Liste der Detections für das erste Bild im Batch (wir füttern ja einzeln)
+            # Yolo Wrapper gibt Listen von Listen von Dicts zurück? 
+            # Check models/onnx_models.py -> forward -> gibt "person_results" zurück
+            # person_results = [[{'bbox': ...}, ...]]
+            
+            frame_dets = det_result[i] if i < len(det_result) else [] # Falls batch forward, aber wir machen loop
+            
+            # Da wir oben im Loop einzeln aufrufen (img[None]), ist det_result[0] unsere Liste
+            dets = det_result[0]
+            
+            if not dets:
+                all_bboxes.append(None)
+                continue
+            
+            # Suche größtes Gesicht in diesem Frame
+            best_bbox = None
+            best_area_local = 0
+            
+            for d in dets:
+                bb = d['bbox'] # [x, y, w, h, score] oder ähnlich (xyxy format aus wrapper?)
+                # Wrapper process_results convertiert zu xywh wenn select_type='max'
+                # Yolo class init default ist 'max'.
+                # bbox format in process_results: [x, y, w, h, score]
+                
+                # Sicherheitscheck Dimensionen
+                w, h = bb[2], bb[3]
+                if w < 1 or h < 1: continue
+                
+                area = w * h
+                if area > best_area_local:
+                    best_area_local = area
+                    best_bbox = bb[:4] # x, y, w, h
+            
+            all_bboxes.append(best_bbox)
+            
+            if best_bbox is not None:
+                found_any_face = True
+                if best_area_local > max_area:
+                    max_area = best_area_local
+                    # Apply padding to champion size calculation to define target tensor size
+                    # (Wir wollen ja das gepaddete Gesicht als Referenz)
+                    # Aber Aspect Ratio berechnen wir vom "raw" face, padding wird später draufgerechnet
+                    # Strategie: Wir definieren die Tensor-Größe anhand des Raw-Champion + Padding
+                    
+                    # Champion Raw Size
+                    cw, ch = best_bbox[2], best_bbox[3]
+                    
+                    # Pad addieren
+                    pad_w = cw * face_pad_factor
+                    pad_h = ch * face_pad_factor
+                    target_w = cw + 2 * pad_w
+                    target_h = ch + 2 * pad_h
+                    
+                    champion_size = (int(target_w), int(target_h))
+                    champion_aspect = target_w / target_h
+
+        detector.cleanup()
+
+        if not found_any_face:
+            print("WanFaceV2: No faces found in any frame. Returning empty/black.")
+            # Dummy output
+            dummy = torch.zeros((batch_size, 512, 512, 3), dtype=torch.float32)
+            dummy_info = [{"valid": False} for _ in range(batch_size)]
+            return (dummy, dummy_info)
+
+        # Champion definiert die Tensor-Größe
+        # Um sicherzugehen, machen wir gerade Zahlen (ViT mag das oft lieber, Encoder auch)
+        tensor_w = (champion_size[0] // 2) * 2
+        tensor_h = (champion_size[1] // 2) * 2
+        
+        # Tensor vorbereiten
+        face_tensor = np.zeros((batch_size, tensor_h, tensor_w, 3), dtype=np.float32)
+        face_infos = []
+
+        # --- PASS 2: Crop & Upscale ---
+        for i in tqdm(range(batch_size), desc="FaceV2: Cropping"):
+            img = images_np[i]
+            bbox = all_bboxes[i]
+            
+            info = {
+                "frame_index": i,
+                "original_img_shape": (img_w, img_h), # (W, H)
+                "valid": False,
+                "tensor_size": (tensor_w, tensor_h),
+                "champion_size_raw": champion_size
+            }
+            
+            if bbox is None:
+                face_infos.append(info)
+                continue
+                
+            bx, by, bw, bh = bbox
+            cx, cy = bx + bw/2, by + bh/2
+            
+            # Ziel: Crop mit champion_aspect
+            # Wir passen das aktuelle Rechteck so an, dass es das Gesicht enthält,
+            # aber das Aspect Ratio des Champions hat.
+            
+            current_aspect = bw / bh
+            
+            if current_aspect > champion_aspect:
+                # Gesicht ist breiter als Champion -> Höhe anpassen
+                # w bleibt, h muss wachsen
+                crop_w = bw
+                crop_h = bw / champion_aspect
+            else:
+                # Gesicht ist höher als Champion -> Breite anpassen
+                crop_h = bh
+                crop_w = bh * champion_aspect
+            
+            # Jetzt Padding hinzufügen (prozentual zur neuen Box)
+            crop_w *= (1.0 + 2 * face_pad_factor)
+            crop_h *= (1.0 + 2 * face_pad_factor)
+            
+            # Koordinaten berechnen (zentriert um Original-Center)
+            x1 = cx - crop_w / 2
+            y1 = cy - crop_h / 2
+            x2 = cx + crop_w / 2
+            y2 = cy + crop_h / 2
+            
+            # Koordinaten für info speichern (Float, Image-Space)
+            info["crop_coords"] = (x1, y1, x2, y2)
+            info["valid"] = True
+            
+            # Pixel-Koordinaten für Crop
+            ix1, iy1 = int(round(x1)), int(round(y1))
+            ix2, iy2 = int(round(x2)), int(round(y2))
+            
+            # Safe Crop mit Padding (wenn out of bounds)
+            # Wir nutzen cv2 warpAffine für sub-pixel genaues Croppen und Resizen in einem Schritt?
+            # Oder einfaches Padding. Padding ist sicherer gegen Verzerrung.
+            
+            # Pad Image if needed
+            pad_l = max(0, -ix1)
+            pad_t = max(0, -iy1)
+            pad_r = max(0, ix2 - img_w)
+            pad_b = max(0, iy2 - img_h)
+            
+            if any([pad_l, pad_t, pad_r, pad_b]):
+                img_padded = cv2.copyMakeBorder(img, pad_t, pad_b, pad_l, pad_r, cv2.BORDER_CONSTANT, value=(0,0,0))
+                # Koordinaten verschieben
+                crop = img_padded[iy1+pad_t : iy2+pad_t, ix1+pad_l : ix2+pad_l]
+            else:
+                crop = img[iy1:iy2, ix1:ix2]
+            
+            # Resize auf Tensor-Größe (Das ist der Upscale-Schritt für kleine Gesichter!)
+            # Wir nehmen INTER_CUBIC für beste Qualität beim Upscaling
+            # INTER_AREA wäre besser für Downscaling.
+            scale_factor = tensor_w / crop_w # Nur zur Info
+            info["scale_factor_to_tensor"] = float(scale_factor)
+            
+            if crop.shape[0] > 0 and crop.shape[1] > 0:
+                resized_face = cv2.resize(crop, (tensor_w, tensor_h), interpolation=cv2.INTER_CUBIC)
+                face_tensor[i] = resized_face
+            
+            face_infos.append(info)
+
+        return (torch.from_numpy(face_tensor), face_infos)
+
+
+class WanFaceStitcherV2:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "destination_images": ("IMAGE",),
+                "upscaled_face_images": ("IMAGE",),
+                "face_info": ("FACE_INFO",),
+                "mode": (["Resize Face to Dest", "Resize Dest to Fit Face"], {"default": "Resize Dest to Fit Face", "tooltip": "Modus B skaliert den Hintergrund hoch, damit das restaurierte Gesicht in voller Schärfe hineinpasst."}),
+                "blend_feather": ("INT", {"default": 32, "min": 0, "max": 512, "step": 1}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("stitched_images",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "Stitches faces back. In 'Resize Dest to Fit Face' mode, it calculates the optimal resolution for the background to match the high-res face detail."
+
+    def process(self, destination_images, upscaled_face_images, face_info, mode, blend_feather):
+        dest_np = destination_images.cpu().numpy() # (B, H, W, 3)
+        faces_np = upscaled_face_images.cpu().numpy() # (B, H_face, W_face, 3)
+        
+        batch_size = len(dest_np)
+        
+        # --- GLOBALE SKALIERUNG BERECHNEN (für Modus B) ---
+        # Wir wollen verhindern, dass das Video in jedem Frame die Auflösung ändert (Wobbling).
+        # Deshalb berechnen wir EINEN globalen Skalierungsfaktor basierend auf dem "Champion"-Verhältnis.
+        # face_info enthält 'tensor_size' (Größe im Extractor) und 'original_img_shape'.
+        # faces_np hat die 'restored_size'.
+        
+        target_dest_w, target_dest_h = dest_np.shape[2], dest_np.shape[1]
+        
+        if mode == "Resize Dest to Fit Face" and len(face_info) > 0:
+            # Wir schauen uns das erste valid info an, um die Tensor-Größe zu finden
+            ref_info = next((f for f in face_info if f.get("valid", False)), None)
+            
+            if ref_info:
+                tensor_w, tensor_h = ref_info["tensor_size"] # Größe im Extractor (z.B. 512x512)
+                restored_h, restored_w = faces_np.shape[1], faces_np.shape[2] # Größe nach Restore (z.B. 1024x1024)
+                
+                # Faktor, um den das Gesicht extern verbessert wurde (z.B. 2.0)
+                restore_factor = restored_w / tensor_w 
+                
+                # Wir wenden diesen Faktor auf das Original-Bildformat an.
+                # Damit wird der Hintergrund genau so stark vergrößert wie das Champion-Gesicht.
+                orig_w, orig_h = ref_info["original_img_shape"]
+                
+                # Neue Zielgröße für den Hintergrund
+                target_dest_w = int(orig_w * restore_factor)
+                target_dest_h = int(orig_h * restore_factor)
+                
+                print(f"WanStitcherV2: Smart-Scale active. Scaling Dest from {orig_w}x{orig_h} to {target_dest_w}x{target_dest_h} (Factor {restore_factor:.2f})")
+
+        # Ausgabepuffer erstellen
+        output_batch = np.zeros((batch_size, target_dest_h, target_dest_w, 3), dtype=np.float32)
+        
+        for i in tqdm(range(batch_size), desc="FaceV2: Stitching"):
+            # 1. Hintergrund vorbereiten
+            bg_img = dest_np[i]
+            bg_h, bg_w = bg_img.shape[:2]
+            
+            # Falls nötig, Hintergrund skalieren
+            if bg_w != target_dest_w or bg_h != target_dest_h:
+                bg_img = cv2.resize(bg_img, (target_dest_w, target_dest_h), interpolation=cv2.INTER_CUBIC)
+            
+            output_batch[i] = bg_img
+            
+            # 2. Face Info prüfen
+            if i >= len(face_info) or not face_info[i]["valid"]:
+                continue
+                
+            info = face_info[i]
+            face_img = faces_np[i] # Das restaurierte Gesicht
+            
+            # 3. Zielkoordinaten berechnen
+            # Wir haben die Crop-Koordinaten im Original-Bild-Space (x1, y1, x2, y2 floats)
+            ox1, oy1, ox2, oy2 = info["crop_coords"]
+            orig_w, orig_h = info["original_img_shape"]
+            
+            # Skalierungsfaktor vom Original zum neuen Ziel-Hintergrund
+            scale_x = target_dest_w / orig_w
+            scale_y = target_dest_h / orig_h
+            
+            # Transformiere Koordinaten in den Ziel-Space
+            tx1 = int(round(ox1 * scale_x))
+            ty1 = int(round(oy1 * scale_y))
+            tx2 = int(round(ox2 * scale_x))
+            ty2 = int(round(oy2 * scale_y))
+            
+            target_w_face = tx2 - tx1
+            target_h_face = ty2 - ty1
+            
+            if target_w_face <= 0 or target_h_face <= 0:
+                continue
+                
+            # 4. Gesicht einpassen
+            # Das restaurierte Gesicht (face_img) muss jetzt in die Box (tx1, ty1, width, height) passen.
+            # In Modus B sollte face_img für das Champion-Gesicht exakt passen (1:1).
+            # Für kleinere Gesichter ist face_img wahrscheinlich größer als die Box -> Downscale (gut für Qualität).
+            
+            fh, fw = face_img.shape[:2]
+            if fw != target_w_face or fh != target_h_face:
+                face_img_resized = cv2.resize(face_img, (target_w_face, target_h_face), interpolation=cv2.INTER_AREA)
+            else:
+                face_img_resized = face_img
+                
+            # 5. Maske für weiches Blending
+            mask = np.zeros((target_h_face, target_w_face), dtype=np.float32)
+            # Einfacher rechteckiger Fade oder Ellipse? Ellipse ist meist besser für Gesichter.
+            # Wir machen hier eine Rechteck-Blende mit Feather, wie im Input gewünscht.
+            
+            # Feather berechnen (relativ zur Größe, aber mindestens 1px)
+            feather = min(blend_feather, target_w_face//2, target_h_face//2)
+            
+            if feather > 0:
+                # Weißes Rechteck in der Mitte, schwarz am Rand
+                # Wir füllen alles weiß
+                mask[:] = 1.0
+                # Ränder abdunkeln (linear gradient)
+                # Oben
+                mask[:feather, :] = np.linspace(0, 1, feather)[:, None]
+                # Unten
+                mask[-feather:, :] = np.linspace(1, 0, feather)[:, None]
+                # Links
+                # Wir müssen aufpassen, dass wir die Ecken korrekt multiplizieren
+                mask_h = mask.copy() # Vertikaler Verlauf
+                
+                mask_w = np.ones_like(mask)
+                mask_w[:, :feather] = np.linspace(0, 1, feather)[None, :]
+                mask_w[:, -feather:] = np.linspace(1, 0, feather)[None, :]
+                
+                mask = mask_h * mask_w
+            else:
+                mask[:] = 1.0
+                
+            mask = mask[..., None] # (H, W, 1)
+            
+            # 6. Einfügen (mit Bounds Check)
+            # Koordinaten clipping für das Zielbild
+            dest_x1 = max(0, tx1)
+            dest_y1 = max(0, ty1)
+            dest_x2 = min(target_dest_w, tx2)
+            dest_y2 = min(target_dest_h, ty2)
+            
+            # Offsets für das Quellgesicht (falls wir am Rand abgeschnitten wurden)
+            src_x1 = dest_x1 - tx1
+            src_y1 = dest_y1 - ty1
+            src_x2 = src_x1 + (dest_x2 - dest_x1)
+            src_y2 = src_y1 + (dest_y2 - dest_y1)
+            
+            if dest_x2 > dest_x1 and dest_y2 > dest_y1:
+                face_crop = face_img_resized[src_y1:src_y2, src_x1:src_x2]
+                mask_crop = mask[src_y1:src_y2, src_x1:src_x2]
+                
+                bg_slice = output_batch[i, dest_y1:dest_y2, dest_x1:dest_x2]
+                
+                # Blending: Output = Face * Mask + BG * (1 - Mask)
+                blended = face_crop * mask_crop + bg_slice * (1.0 - mask_crop)
+                output_batch[i, dest_y1:dest_y2, dest_x1:dest_x2] = blended
+
+        return (torch.from_numpy(output_batch),)
+
 class KeypointTrimNode:
     @classmethod
     def INPUT_TYPES(s):
@@ -11137,6 +11523,8 @@ class PoseRetargetPromptHelper:
         return (tpl_prompt, refer_prompt, )
 
 NODE_CLASS_MAPPINGS = {
+    "WanFaceExtractorV2": WanFaceExtractorV2,
+    "WanFaceStitcherV2": WanFaceStitcherV2,
     "KeypointTrimNode": KeypointTrimNode,
     "WanFaceExtractor": WanFaceExtractor,
     "WanFaceStitcher": WanFaceStitcher,
@@ -11179,6 +11567,8 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataAutoBlackoutOnJitter": PoseDataAutoBlackoutOnJitter,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "WanFaceExtractorV2": "Wan Face Extractor V2 (Champion Based)",
+    "WanFaceStitcherV2": "Wan Face Stitcher V2 (Smart Scale)",
     "KeypointTrimNode": "Keypoint Trim (Video/Audio)",
     "WanFaceExtractor": "Wan Face Extractor (Coords)",
     "WanFaceStitcher": "Wan Face Stitcher (Coords)",
@@ -11221,6 +11611,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataAutoBlackoutOnJitter": "Auto Blackout On Jitter",
     
 }
+
 
 
 
