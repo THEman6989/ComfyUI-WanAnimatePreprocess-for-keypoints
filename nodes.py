@@ -86,6 +86,248 @@ FULL_BODY_LENGTH_PAIRS = TORSO_LENGTH_PAIRS + [
     (12, 13),  # left knee to left ankle
 ]
 
+class PoseAndFaceDetectionV4:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("POSEMODEL",),
+                "images": ("IMAGE",),
+                "width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 1, "tooltip": "Breite der Generierung (für Pose Data)."}),
+                "height": ("INT", {"default": 480, "min": 64, "max": 2048, "step": 1, "tooltip": "Höhe der Generierung (für Pose Data)."}),
+                "face_resolution": ("INT", {"default": 512, "min": 256, "max": 2048, "step": 64, "tooltip": "Auflösung, auf die die ausgeschnittenen Gesichter skaliert werden."}),
+                "face_pad_factor": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 2.0, "step": 0.05, "tooltip": "Rand um das Gesicht (Skalierungsfaktor der BBox)."}),
+            },
+            "optional": {
+                "retarget_image": ("IMAGE", {"default": None, "tooltip": "Optionales Referenzbild für Pose Retargeting."}),
+            },
+        }
+
+    RETURN_TYPES = ("POSEDATA", "IMAGE", "FACE_INFO", "STRING", "BBOX", "BBOX")
+    RETURN_NAMES = ("pose_data", "face_images", "face_info_v2", "key_frame_body_points", "bboxes", "face_bboxes")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "V4: Basiert auf V2 (schnell/einzelne Frames), gibt aber 'FACE_INFO' aus, um kompatibel mit dem WanFaceStitcher V3 zu sein."
+
+    def process(self, model, images, width, height, face_resolution, face_pad_factor, retarget_image=None):
+        detector = model["yolo"]
+        pose_model = model["vitpose"]
+        B, H, W, C = images.shape
+
+        shape = np.array([H, W])[None]
+        images_np = images.numpy()
+
+        IMG_NORM_MEAN = np.array([0.485, 0.456, 0.406])
+        IMG_NORM_STD = np.array([0.229, 0.224, 0.225])
+        input_resolution=(256, 192)
+        rescale = 1.25
+
+        detector.reinit()
+        pose_model.reinit()
+        
+        # --- 1. Retarget Image Logic (aus V2 übernommen) ---
+        refer_pose_meta = None
+        refer_img = None
+        
+        if retarget_image is not None:
+            refer_img = resize_by_area(retarget_image[0].numpy() * 255, width * height, divisor=16) / 255.0
+            ref_bbox = (detector(
+                cv2.resize(refer_img.astype(np.float32), (640, 640)).transpose(2, 0, 1)[None],
+                shape
+                )[0][0]["bbox"])
+
+            if ref_bbox is None or ref_bbox[-1] <= 0:
+                ref_bbox = np.array([0, 0, refer_img.shape[1], refer_img.shape[0]])
+
+            center, scale = bbox_from_detector(ref_bbox, input_resolution, rescale=rescale)
+            refer_img_crop = crop(refer_img, center, scale, (input_resolution[0], input_resolution[1]))[0]
+
+            img_norm = (refer_img_crop - IMG_NORM_MEAN) / IMG_NORM_STD
+            img_norm = img_norm.transpose(2, 0, 1).astype(np.float32)
+
+            ref_keypoints = pose_model(img_norm[None], np.array(center)[None], np.array(scale)[None])
+            refer_pose_meta = load_pose_metas_from_kp2ds_seq(ref_keypoints, width=retarget_image.shape[2], height=retarget_image.shape[1])[0]
+
+        # --- 2. Detection Pass (aus V2 übernommen) ---
+        comfy_pbar = ProgressBar(B*2)
+        progress = 0
+        bboxes = []
+        for img in tqdm(images_np, total=len(images_np), desc="V4: Detecting"):
+            det_result = detector(
+                cv2.resize(img, (640, 640)).transpose(2, 0, 1)[None],
+                shape
+            )
+            bbox_res = det_result[0][0]["bbox"]
+            bboxes.append(bbox_res)
+            
+            progress += 1
+            if progress % 10 == 0:
+                comfy_pbar.update_absolute(progress)
+
+        detector.cleanup()
+
+        # --- 3. Pose Estimation Pass (aus V2 übernommen) ---
+        kp2ds = []
+        for img, bbox in tqdm(zip(images_np, bboxes), total=len(images_np), desc="V4: Keypoints"):
+            if bbox is None or bbox[-1] <= 0:
+                bbox = np.array([0, 0, img.shape[1], img.shape[0]])
+
+            bbox_xywh = bbox
+            center, scale = bbox_from_detector(bbox_xywh, input_resolution, rescale=rescale)
+            img_crop = crop(img, center, scale, (input_resolution[0], input_resolution[1]))[0]
+
+            img_norm = (img_crop - IMG_NORM_MEAN) / IMG_NORM_STD
+            img_norm = img_norm.transpose(2, 0, 1).astype(np.float32)
+
+            keypoints = pose_model(img_norm[None], np.array(center)[None], np.array(scale)[None])
+            kp2ds.append(keypoints)
+            
+            progress += 1
+            if progress % 10 == 0:
+                comfy_pbar.update_absolute(progress)
+
+        pose_model.cleanup()
+
+        kp2ds = np.concatenate(kp2ds, 0)
+        pose_metas = load_pose_metas_from_kp2ds_seq(kp2ds, width=W, height=H)
+
+        # --- 4. Face Extraction & V3 Mapping Generation ---
+        # Hier geschieht die Anpassung: Wir nutzen V2 Logik für den Crop,
+        # erstellen aber das V3 Info-Dictionary.
+        
+        face_images = []
+        face_bboxes = []
+        face_info_v3_compatible = []
+
+        for idx, meta in enumerate(pose_metas):
+            # Wir nutzen die Helper Funktion, die auch V2/V3 nutzen (definiert in utils.py oder lokal)
+            # scale = 1.0 Basis + User Padding
+            # V2 hatte hardcoded 1.3, hier machen wir es konfigurierbar (1.0 + pad_factor)
+            scale_val = 1.0 + face_pad_factor
+            
+            # Keypoints fürs Gesicht extrahieren
+            # Hinweis: Wir nutzen hier eine lokale Implementierung oder die importierte, 
+            # ich repliziere die Logik hier sicherheitshalber, falls `get_face_bboxes` variiert.
+            kp_face = meta['keypoints_face'][:, :2]
+            
+            # --- BBox Berechnung (V2 Style) ---
+            min_x, min_y = np.min(kp_face, axis=0)
+            max_x, max_y = np.max(kp_face, axis=0)
+            
+            initial_width = max_x - min_x
+            initial_height = max_y - min_y
+            
+            # Wenn kein Gesicht gefunden (Punkte auf 0), Fallback
+            if initial_width <= 1 or initial_height <= 1:
+                # Fallback Koordinaten (Mitte)
+                cx, cy = W // 2, H // 2
+                size = 64
+                x1, y1, x2, y2 = cx-size, cy-size, cx+size, cy+size
+                valid_face = False
+            else:
+                initial_area = initial_width * initial_height
+                expanded_area = initial_area * scale_val
+                
+                # Aspect Ratio beibehalten beim Expandieren
+                new_width = np.sqrt(expanded_area * (initial_width / initial_height))
+                new_height = np.sqrt(expanded_area * (initial_height / initial_width))
+                
+                delta_width = (new_width - initial_width) / 2
+                delta_height = (new_height - initial_height) / 4 # Mehr Padding oben (Stirn) in V2 Logik oft so
+                
+                expanded_min_x = max(min_x - delta_width, 0)
+                expanded_max_x = min(max_x + delta_width, W)
+                expanded_min_y = max(min_y - 3 * delta_height, 0)
+                expanded_max_y = min(max_y + delta_height, H)
+                
+                x1, y1, x2, y2 = int(expanded_min_x), int(expanded_min_y), int(expanded_max_x), int(expanded_max_y)
+                valid_face = True
+
+            # Crop durchführen
+            face_image = images_np[idx][y1:y2, x1:x2]
+            
+            # Leere Crops abfangen
+            if face_image.size == 0:
+                face_image = np.zeros((face_resolution, face_resolution, C), dtype=images_np.dtype)
+                valid_face = False
+            
+            # Resize auf Zielauflösung (V2 resized immer, V3 Stitcher mag das)
+            # Interpolation Cubic für bessere Qualität
+            face_image_resized = cv2.resize(face_image, (face_resolution, face_resolution), interpolation=cv2.INTER_CUBIC)
+            face_images.append(face_image_resized)
+            
+            # BBox für Output speichern
+            face_bboxes.append((x1, y1, x2, y2))
+            
+            # --- V3 Compatible INFO erstellen ---
+            # Das ist der entscheidende Teil für den Stitcher V3.
+            # Er braucht 'crop_coords' (float tuple) und 'original_img_shape'.
+            # 'padding' setzen wir auf 0, da V2 Logik meist clippt statt paddet beim Crop.
+            
+            info_entry = {
+                "frame_index": idx,
+                "original_img_shape": (W, H),
+                "valid": valid_face,
+                "crop_coords": (float(x1), float(y1), float(x2), float(y2)),
+                "padding": (0, 0, 0, 0), # (left, top, right, bottom)
+                # Optionale Infos, die V3 evtl nutzt
+                "target_tensor_size": (face_resolution, face_resolution)
+            }
+            face_info_v3_compatible.append(info_entry)
+
+        # Tensor erstellen
+        face_images_tensor = torch.from_numpy(np.stack(face_images, 0))
+
+        # --- 5. Pose Data Structuring (V2 Standard) ---
+        if retarget_image is not None and refer_pose_meta is not None:
+            retarget_pose_metas = get_retarget_pose(pose_metas[0], refer_pose_meta, pose_metas, None, None)
+        else:
+            retarget_pose_metas = [AAPoseMeta.from_humanapi_meta(meta) for meta in pose_metas]
+
+        # BBoxes List formatieren
+        final_bboxes_list = []
+        for bb in bboxes:
+            bb_flat = np.array(bb).flatten()
+            if bb_flat.shape[0] >= 4:
+                bbox_ints = tuple(int(v) for v in bb_flat[:4])
+            else:
+                bbox_ints = (0, 0, 0, 0)
+            final_bboxes_list.append(bbox_ints)
+
+        # Keypoints JSON (V2 Logic)
+        key_frame_num = 4 if B >= 4 else 1
+        key_frame_step = len(pose_metas) // key_frame_num
+        key_frame_index_list = list(range(0, len(pose_metas), key_frame_step))
+        key_points_index = [0, 1, 2, 5, 8, 11, 10, 13]
+        
+        points_dict_list = [] 
+        for key_frame_index in key_frame_index_list:
+            if key_frame_index < len(pose_metas):
+                keypoints_body_list = []
+                body_key_points = pose_metas[key_frame_index]['keypoints_body']
+                for each_index in key_points_index:
+                    each_keypoint = body_key_points[each_index]
+                    if None is each_keypoint:
+                        continue
+                    keypoints_body_list.append(each_keypoint)
+
+                if keypoints_body_list:
+                    keypoints_body = np.array(keypoints_body_list)[:, :2]
+                    wh = np.array([[pose_metas[0]['width'], pose_metas[0]['height']]])
+                    points = (keypoints_body * wh).astype(np.int32)
+                    # Wir sammeln alle Punkte in einer flachen Liste für das JSON (wie V2)
+                    for point in points:
+                        points_dict_list.append({"x": int(point[0]), "y": int(point[1])})
+
+        pose_data = {
+            "retarget_image": refer_img if retarget_image is not None else None,
+            "pose_metas": retarget_pose_metas,
+            "refer_pose_meta": refer_pose_meta if retarget_image is not None else None,
+            "pose_metas_original": pose_metas,
+        }
+
+        return (pose_data, face_images_tensor, face_info_v3_compatible, json.dumps(points_dict_list), final_bboxes_list, face_bboxes)
+
 # --- HILFSFUNKTION FÜR V3 (Verhindert Black-Image-Bug) ---
 # --- HILFSFUNKTION FÜR V3 (Verhindert Black-Image-Bug) ---
 def get_face_bboxes_v3(kp2ds, scale, image_shape, ratio_aug=False):
@@ -11852,6 +12094,7 @@ class PoseRetargetPromptHelper:
         return (tpl_prompt, refer_prompt, )
 
 NODE_CLASS_MAPPINGS = {
+    "PoseAndFaceDetectionV4": PoseAndFaceDetectionV4,
     "PoseAndFaceDetectionV3": PoseAndFaceDetectionV3,
     "WanFaceStitcherV3": WanFaceStitcherV3,
     "WanFaceExtractorV2": WanFaceExtractorV2,
@@ -11898,6 +12141,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataAutoBlackoutOnJitter": PoseDataAutoBlackoutOnJitter,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "PoseAndFaceDetectionV4": "Pose and Face Detection V4 (Stitcher V3 Compatible)",
     "PoseAndFaceDetectionV3": "Pose and Face Detection V3 (Champion Aspect)",
     "WanFaceStitcherV3": "Wan Face Stitcher V3 (Smart Scale)",
     "WanFaceExtractorV2": "Wan Face Extractor V2 (Champion Based)",
@@ -11944,6 +12188,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataAutoBlackoutOnJitter": "Auto Blackout On Jitter",
     
 }
+
 
 
 
