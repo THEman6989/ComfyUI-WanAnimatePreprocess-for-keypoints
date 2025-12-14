@@ -3,6 +3,7 @@ import copy
 import math
 from collections import defaultdict
 
+import random
 import torch
 from tqdm import tqdm
 import numpy as np
@@ -85,6 +86,60 @@ FULL_BODY_LENGTH_PAIRS = TORSO_LENGTH_PAIRS + [
     (12, 13),  # left knee to left ankle
 ]
 
+# --- HILFSFUNKTION FÜR V3 (Verhindert Black-Image-Bug) ---
+# --- HILFSFUNKTION FÜR V3 (Verhindert Black-Image-Bug) ---
+def get_face_bboxes_v3(kp2ds, scale, image_shape, ratio_aug=False):
+    h, w = image_shape
+    
+    # Versuch 1: Nur Gesichts-Keypoints nutzen (Indizes 23-91)
+    # Das ist präziser, wenn das Modell Face-Details liefert.
+    kp2ds_face = kp2ds.copy()[23:91, :2]
+
+    # FALLBACK: Wenn slicing leer ist oder keine Punkte da sind (das verhindert schwarze Bilder!)
+    if kp2ds_face.shape[0] == 0:
+        # Wir nehmen alle Punkte (z.B. Kopf/Nase aus Body-Pose), damit wir IRGENDWAS haben
+        kp2ds_face = kp2ds.copy()
+
+    # Wenn immer noch leer -> Abbruch
+    if kp2ds_face.shape[0] == 0:
+         return [0, 0, 0, 0]
+
+    min_x, min_y = np.min(kp2ds_face, axis=0)
+    max_x, max_y = np.max(kp2ds_face, axis=0)
+
+    initial_width = max_x - min_x
+    initial_height = max_y - min_y
+    
+    # Sicherheitscheck: Wenn Gesicht extrem klein oder 0 Pixel groß
+    if initial_width < 1 or initial_height < 1:
+         # Versuche kleinen Bereich um den ersten Punkt zu retten
+         cx, cy = kp2ds_face[0]
+         return [int(max(0, cx-25)), int(min(w, cx+25)), int(max(0, cy-25)), int(min(h, cy+25))]
+
+    initial_area = initial_width * initial_height
+    expanded_area = initial_area * scale
+
+    new_width = np.sqrt(expanded_area * (initial_width / initial_height))
+    new_height = np.sqrt(expanded_area * (initial_height / initial_width))
+
+    delta_width = (new_width - initial_width) / 2
+    delta_height = (new_height - initial_height) / 4
+
+    # Ratio Augmentation Logik (jetzt sicher integriert)
+    if ratio_aug:
+        import random
+        if random.random() > 0.5:
+            delta_width += random.uniform(0, initial_width // 10)
+        else:
+            delta_height += random.uniform(0, initial_height // 10)
+
+    expanded_min_x = max(min_x - delta_width, 0)
+    expanded_max_x = min(max_x + delta_width, w)
+    expanded_min_y = max(min_y - 3 * delta_height, 0)
+    expanded_max_y = min(max_y + delta_height, h)
+
+    return [int(expanded_min_x), int(expanded_max_x), int(expanded_min_y), int(expanded_max_y)]
+    
 # ==============================================================================
 # WanFace V2 Nodes - "Champion Based High-Fidelity Processing"
 # ==============================================================================
@@ -96,30 +151,30 @@ class PoseAndFaceDetectionV3:
             "required": {
                 "model": ("POSEMODEL",),
                 "images": ("IMAGE",),
-                "width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 1, "tooltip": "Width of the generation (for OpenPose data)"}),
-                "height": ("INT", {"default": 480, "min": 64, "max": 2048, "step": 1, "tooltip": "Height of the generation (for OpenPose data)"}),
-                "face_pad_factor": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 2.0, "step": 0.05, "tooltip": "Padding around the face relative to its size."}),
-                "max_face_resolution": ("INT", {"default": 768, "min": 256, "max": 2048, "step": 32, "tooltip": "Limit for the shortest side of the extracted face tensor to prevent massive VRAM usage."}),
+                "width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 1, "tooltip": "Breite der Generierung"}),
+                "height": ("INT", {"default": 480, "min": 64, "max": 2048, "step": 1, "tooltip": "Höhe der Generierung"}),
+                "face_pad_factor": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 2.0, "step": 0.05, "tooltip": "Rand um das Gesicht"}),
+                "max_face_resolution": ("INT", {"default": 768, "min": 256, "max": 2048, "step": 32, "tooltip": "Max Auflösung Tensor"}),
             },
             "optional": {
-                "retarget_image": ("IMAGE", {"default": None, "tooltip": "Optional reference image for pose retargeting"}),
+                "retarget_image": ("IMAGE", {"default": None}),
             },
         }
 
     RETURN_TYPES = ("POSEDATA", "IMAGE", "IMAGE", "FACE_INFO", "STRING", "BBOX", "BBOX")
-    RETURN_NAMES = ("pose_data", "face_images", "face_images_v2", "face_info_v2", "key_frame_body_points", "bboxes", "face_bboxes")
+    RETURN_NAMES = ("pose_data", "face_images_legacy", "face_images_v2", "face_info_v2", "key_frame_body_points", "bboxes", "face_bboxes")
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess"
-    DESCRIPTION = "V3: Detects poses/faces. 'Face Images V2' aligns all faces to the aspect ratio of the largest detected face (Champion) and upscales them to the Champion's resolution. Includes Metadata for stitching."
+    DESCRIPTION = "V3: Extrahiert Gesichter basierend auf der 'Champion'-Größe ohne Verzerrung."
 
     def process(self, model, images, width, height, face_pad_factor, max_face_resolution, retarget_image=None):
         detector = model["yolo"]
         pose_model = model["vitpose"]
         B, H, W, C = images.shape
-
         shape = np.array([H, W])[None]
         images_np = images.numpy()
-
+        
+        # Imports für Helper
         IMG_NORM_MEAN = np.array([0.485, 0.456, 0.406])
         IMG_NORM_STD = np.array([0.229, 0.224, 0.225])
         input_resolution = (256, 192)
@@ -128,259 +183,162 @@ class PoseAndFaceDetectionV3:
         detector.reinit()
         pose_model.reinit()
 
-        # --- Reference Logic (Same as V2) ---
+        # 1. Reference Image Logic (Legacy)
         refer_pose_meta = None
         refer_img = None
-        
         if retarget_image is not None:
             refer_img = resize_by_area(retarget_image[0].numpy() * 255, width * height, divisor=16) / 255.0
-            ref_bbox = (detector(
-                cv2.resize(refer_img.astype(np.float32), (640, 640)).transpose(2, 0, 1)[None],
-                shape
-                )[0][0]["bbox"])
-
-            if ref_bbox is None or ref_bbox[-1] <= 0 or (ref_bbox[2] - ref_bbox[0]) < 10 or (ref_bbox[3] - ref_bbox[1]) < 10:
-                ref_bbox = np.array([0, 0, refer_img.shape[1], refer_img.shape[0]])
-
+            ref_bbox = (detector(cv2.resize(refer_img.astype(np.float32), (640, 640)).transpose(2, 0, 1)[None], shape)[0][0]["bbox"])
+            if ref_bbox is None or ref_bbox[-1] <= 0: ref_bbox = np.array([0, 0, refer_img.shape[1], refer_img.shape[0]])
             center, scale = bbox_from_detector(ref_bbox, input_resolution, rescale=rescale)
             refer_img_crop = crop(refer_img, center, scale, (input_resolution[0], input_resolution[1]))[0]
-
             img_norm = (refer_img_crop - IMG_NORM_MEAN) / IMG_NORM_STD
             img_norm = img_norm.transpose(2, 0, 1).astype(np.float32)
-
             ref_keypoints = pose_model(img_norm[None], np.array(center)[None], np.array(scale)[None])
             refer_pose_meta = load_pose_metas_from_kp2ds_seq(ref_keypoints, width=retarget_image.shape[2], height=retarget_image.shape[1])[0]
 
-        # --- Pass 1: Detection & Pose Estimation ---
+        # 2. Detection Loop
         comfy_pbar = ProgressBar(B*2)
         progress = 0
         bboxes = []
-        
-        for img in tqdm(images_np, total=len(images_np), desc="Detecting bboxes"):
-            det_result = detector(
-                cv2.resize(img, (640, 640)).transpose(2, 0, 1)[None],
-                shape
-            )
-            bbox_res = det_result[0][0]["bbox"]
-            bboxes.append(bbox_res)
+        for img in tqdm(images_np, desc="V3: Detecting"):
+            det_result = detector(cv2.resize(img, (640, 640)).transpose(2, 0, 1)[None], shape)
+            bboxes.append(det_result[0][0]["bbox"])
             progress += 1
             if progress % 10 == 0: comfy_pbar.update_absolute(progress)
-
         detector.cleanup()
 
+        # 3. Pose Loop
         kp2ds = []
-        for img, bbox in tqdm(zip(images_np, bboxes), total=len(images_np), desc="Extracting keypoints"):
-            if bbox is None or bbox[-1] <= 0:
-                bbox = np.array([0, 0, img.shape[1], img.shape[0]])
-
-            bbox_xywh = bbox
-            center, scale = bbox_from_detector(bbox_xywh, input_resolution, rescale=rescale)
+        for img, bbox in tqdm(zip(images_np, bboxes), total=len(images_np), desc="V3: Poses"):
+            if bbox is None or bbox[-1] <= 0: bbox = np.array([0, 0, img.shape[1], img.shape[0]])
+            center, scale = bbox_from_detector(bbox, input_resolution, rescale=rescale)
             img_crop = crop(img, center, scale, (input_resolution[0], input_resolution[1]))[0]
-
             img_norm = (img_crop - IMG_NORM_MEAN) / IMG_NORM_STD
             img_norm = img_norm.transpose(2, 0, 1).astype(np.float32)
-
-            keypoints = pose_model(img_norm[None], np.array(center)[None], np.array(scale)[None])
-            kp2ds.append(keypoints)
+            kp2ds.append(pose_model(img_norm[None], np.array(center)[None], np.array(scale)[None]))
             progress += 1
             if progress % 10 == 0: comfy_pbar.update_absolute(progress)
-
         pose_model.cleanup()
 
         kp2ds = np.concatenate(kp2ds, 0)
         pose_metas = load_pose_metas_from_kp2ds_seq(kp2ds, width=W, height=H)
 
-        # --- V3 Logic: Champion Search & Aspect Ratio ---
-        
-        # 1. Collect all raw face bboxes (with padding factor applied to size calculation only)
-        raw_face_rects = [] # (x, y, w, h, center_x, center_y)
+        # --- V3 CHAMPION LOGIC ---
+        raw_face_rects = []
         max_area = 0
-        champion_dims = (512, 512) # width, height
+        champion_dims = (512, 512)
         
+        # Pass A: Champion finden
         for idx, meta in enumerate(pose_metas):
-            # Get raw face bbox from keypoints
-            face_bbox = get_face_bboxes(meta['keypoints_face'][:, :2], scale=1.0 + face_pad_factor, image_shape=(H, W), ratio_aug=False)
+            # Verwende die lokale Hilfsfunktion
+            face_bbox = get_face_bboxes_v3(meta['keypoints_face'][:, :2], scale=1.0 + face_pad_factor, image_shape=(H, W), ratio_aug=False)
             x1, x2, y1, y2 = face_bbox
-            w_raw = x2 - x1
-            h_raw = y2 - y1
+            w_raw, h_raw = x2 - x1, y2 - y1
             
             if w_raw > 0 and h_raw > 0:
-                area = w_raw * h_raw
-                raw_face_rects.append({'index': idx, 'rect': (x1, y1, w_raw, h_raw)})
-                
-                # Check for Champion
-                if area > max_area:
-                    max_area = area
+                raw_face_rects.append({'rect': (x1, y1, w_raw, h_raw)})
+                if (w_raw * h_raw) > max_area:
+                    max_area = w_raw * h_raw
                     champion_dims = (w_raw, h_raw)
             else:
-                raw_face_rects.append({'index': idx, 'rect': None})
+                raw_face_rects.append({'rect': None})
 
-        # 2. Determine Target Resolution & Aspect Ratio from Champion
+        # Tensor Größe definieren
         champ_w, champ_h = champion_dims
         target_aspect = champ_w / champ_h
         
-        # Limit resolution (Constraint: Shortest side <= max_face_resolution)
-        shortest_side = min(champ_w, champ_h)
         scale_limiter = 1.0
-        if shortest_side > max_face_resolution:
-            scale_limiter = max_face_resolution / shortest_side
+        if min(champ_w, champ_h) > max_face_resolution:
+            scale_limiter = max_face_resolution / min(champ_w, champ_h)
             
-        target_w = int(champ_w * scale_limiter)
-        target_h = int(champ_h * scale_limiter)
+        target_w = int((champ_w * scale_limiter) // 2) * 2
+        target_h = int((champ_h * scale_limiter) // 2) * 2
         
-        # Ensure divisible by 2 (cleaner tensors)
-        target_w = (target_w // 2) * 2
-        target_h = (target_h // 2) * 2
-        
-        print(f"PoseV3: Champion Size: {champ_w}x{champ_h}. Target Tensor Size: {target_w}x{target_h} (Aspect: {target_aspect:.3f})")
-
-        # --- Pass 3: Extract Faces V2 (Unified Aspect Ratio) ---
-        
+        # Pass B: Extraction mit Aspect Ratio Fix
         face_images_v2 = []
         face_info_v2 = []
-        
-        # Legacy outputs
         face_images_legacy = []
         face_bboxes_legacy = []
 
         for i, meta in enumerate(pose_metas):
-            # Legacy logic
-            face_bbox_legacy = get_face_bboxes(meta['keypoints_face'][:, :2], scale=1.3, image_shape=(H, W), ratio_aug=False)
-            lx1, lx2, ly1, ly2 = face_bbox_legacy
-            face_bboxes_legacy.append((lx1, ly1, lx2, ly2))
-            img_legacy = images_np[i][ly1:ly2, lx1:lx2]
-            if img_legacy.size == 0: img_legacy = np.zeros((64,64,3), dtype=np.float32)
-            face_images_legacy.append(cv2.resize(img_legacy, (512, 512)))
+            # Legacy Output
+            l_bbox = get_face_bboxes_v3(meta['keypoints_face'][:, :2], scale=1.3, image_shape=(H, W))
+            face_bboxes_legacy.append(tuple(l_bbox))
+            l_img = images_np[i][l_bbox[1]:l_bbox[3], l_bbox[0]:l_bbox[2]]
+            if l_img.size == 0: l_img = np.zeros((64,64,3), dtype=np.float32)
+            face_images_legacy.append(cv2.resize(l_img, (512, 512)))
 
-            # V3 Logic
+            # V3 Output
             rect_data = raw_face_rects[i]['rect']
-            
-            info = {
-                "frame_index": i,
-                "original_img_shape": (W, H),
-                "target_tensor_size": (target_w, target_h),
-                "valid": False,
-                "crop_coords": (0, 0, 0, 0), # x1, y1, x2, y2 (float)
-                "padding": (0, 0, 0, 0) # l, t, r, b
-            }
+            info = {"frame_index": i, "original_img_shape": (W, H), "target_tensor_size": (target_w, target_h), "valid": False, "crop_coords": (0,0,0,0), "padding": (0,0,0,0)}
 
             if rect_data is None:
-                # Fallback: Empty black frame
+                # Fallback Black Frame
                 face_images_v2.append(np.zeros((target_h, target_w, C), dtype=np.float32))
                 face_info_v2.append(info)
                 continue
 
+            # Aspect Ratio Calculation
             rx, ry, rw, rh = rect_data
-            cx = rx + rw / 2.0
-            cy = ry + rh / 2.0
+            cx, cy = rx + rw/2.0, ry + rh/2.0
             
-            # Enforce Target Aspect Ratio on this specific face
-            # We want to keep the face fully visible, so we expand the shorter dimension
-            current_aspect = rw / rh
-            
-            if current_aspect > target_aspect:
-                # Too wide -> increase height
-                crop_w = rw
-                crop_h = rw / target_aspect
+            if (rw/rh) > target_aspect:
+                crop_w, crop_h = rw, rw / target_aspect
             else:
-                # Too tall -> increase width
-                crop_h = rh
-                crop_w = rh * target_aspect
-                
-            # Calculate coordinates
-            crop_x1 = cx - crop_w / 2.0
-            crop_y1 = cy - crop_h / 2.0
-            crop_x2 = cx + crop_w / 2.0
-            crop_y2 = cy + crop_h / 2.0
+                crop_w, crop_h = rh * target_aspect, rh
+
+            # Berechne Coordinates
+            crop_x1, crop_y1 = cx - crop_w/2.0, cy - crop_h/2.0
+            crop_x2, crop_y2 = cx + crop_w/2.0, cy + crop_h/2.0
             
-            info["crop_coords"] = (crop_x1, crop_y1, crop_x2, crop_y2)
-            info["valid"] = True
+            info.update({"valid": True, "crop_coords": (crop_x1, crop_y1, crop_x2, crop_y2)})
+
+            # Integer coords
+            ix1, iy1, ix2, iy2 = int(round(crop_x1)), int(round(crop_y1)), int(round(crop_x2)), int(round(crop_y2))
             
-            # Pixel Coordinates & Padding
-            ix1, iy1 = int(round(crop_x1)), int(round(crop_y1))
-            ix2, iy2 = int(round(crop_x2)), int(round(crop_y2))
-            
-            # Calculate padding if out of bounds (black borders)
-            pad_l = max(0, -ix1)
-            pad_t = max(0, -iy1)
-            pad_r = max(0, ix2 - W)
-            pad_b = max(0, iy2 - H)
-            
+            # Padding berechnen (WICHTIG gegen schwarze Bilder bei Rand-Crops)
+            pad_l, pad_t = max(0, -ix1), max(0, -iy1)
+            pad_r, pad_b = max(0, ix2 - W), max(0, iy2 - H)
             info["padding"] = (pad_l, pad_t, pad_r, pad_b)
             
-            # Safe crop from source image
-            # source coords
-            sx1 = max(0, ix1)
-            sy1 = max(0, iy1)
-            sx2 = min(W, ix2)
-            sy2 = min(H, iy2)
+            # Safe Slice (innerhalb des Bildes)
+            sx1, sy1 = max(0, ix1), max(0, iy1)
+            sx2, sy2 = min(W, ix2), min(H, iy2)
             
+            # Extraction & Padding
             if sx2 > sx1 and sy2 > sy1:
                 src_crop = images_np[i][sy1:sy2, sx1:sx2]
-                
-                # Apply padding to restore aspect ratio
                 if any([pad_l, pad_t, pad_r, pad_b]):
-                    img_padded = cv2.copyMakeBorder(src_crop, pad_t, pad_b, pad_l, pad_r, cv2.BORDER_CONSTANT, value=(0,0,0))
-                    crop_final = img_padded
-                else:
-                    crop_final = src_crop
+                    src_crop = cv2.copyMakeBorder(src_crop, pad_t, pad_b, pad_l, pad_r, cv2.BORDER_CONSTANT, value=(0,0,0))
                 
-                # Resize to Target Resolution (Upscale/Downscale)
-                # This aligns all faces to the champion's resolution
-                resized_face = cv2.resize(crop_final, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
-                face_images_v2.append(resized_face)
+                face_images_v2.append(cv2.resize(src_crop, (target_w, target_h), interpolation=cv2.INTER_CUBIC))
             else:
+                # Sollte durch Fallbacks kaum passieren
                 face_images_v2.append(np.zeros((target_h, target_w, C), dtype=np.float32))
-
+            
             face_info_v2.append(info)
 
-        # --- Finalize Outputs ---
-        
-        # V2 Tensor
-        face_images_v2_t = torch.from_numpy(np.stack(face_images_v2, 0))
-        
-        # Legacy Tensor
-        face_images_legacy_t = torch.from_numpy(np.stack(face_images_legacy, 0))
-
-        # Pose Data Construction (Standard)
-        if retarget_image is not None and refer_pose_meta is not None:
-            retarget_pose_metas = get_retarget_pose(pose_metas[0], refer_pose_meta, pose_metas, None, None)
-        else:
-            retarget_pose_metas = [AAPoseMeta.from_humanapi_meta(meta) for meta in pose_metas]
-
-        # BBoxes formatting
-        final_bboxes_list = []
-        for bb in bboxes:
-            bb_flat = np.array(bb).flatten()
-            if bb_flat.shape[0] >= 4:
-                bbox_ints = tuple(int(v) for v in bb_flat[:4])
-            else:
-                bbox_ints = (0, 0, 0, 0)
-            final_bboxes_list.append(bbox_ints)
-
-        # Keypoints for JSON
-        key_frame_num = 4 if B >= 4 else 1
-        key_frame_step = len(pose_metas) // key_frame_num
-        key_frame_index_list = list(range(0, len(pose_metas), key_frame_step))
-        key_points_index = [0, 1, 2, 5, 8, 11, 10, 13]
-        points_dict_list = []
-        for key_frame_index in key_frame_index_list:
-            if key_frame_index < len(pose_metas):
-                body_key_points = pose_metas[key_frame_index]['keypoints_body']
-                for each_index in key_points_index:
-                    each_keypoint = body_key_points[each_index]
-                    if None is each_keypoint: continue
-                    points_dict_list.append({"x": int(each_keypoint[0]), "y": int(each_keypoint[1])})
-
+        # Returns construction
         pose_data = {
             "retarget_image": refer_img if retarget_image is not None else None,
-            "pose_metas": retarget_pose_metas,
+            "pose_metas": get_retarget_pose(pose_metas[0], refer_pose_meta, pose_metas, None, None) if (retarget_image is not None and refer_pose_meta is not None) else [AAPoseMeta.from_humanapi_meta(meta) for meta in pose_metas],
             "refer_pose_meta": refer_pose_meta if retarget_image is not None else None,
             "pose_metas_original": pose_metas,
         }
+        
+        # BBoxes
+        final_bboxes = [tuple(int(x) for x in np.array(bb).flatten()[:4]) if np.array(bb).size >=4 else (0,0,0,0) for bb in bboxes]
+        
+        # Points
+        points_list = []
+        kf_step = max(1, len(pose_metas) // (4 if B >= 4 else 1))
+        for k in range(0, len(pose_metas), kf_step):
+            kp = pose_metas[k]['keypoints_body']
+            for idx in [0,1,2,5,8,11,10,13]:
+                if kp[idx] is not None: points_list.append({"x": int(kp[idx][0]), "y": int(kp[idx][1])})
 
-        return (pose_data, face_images_legacy_t, face_images_v2_t, face_info_v2, json.dumps(points_dict_list), final_bboxes_list, face_bboxes_legacy)
-
+        return (pose_data, torch.from_numpy(np.stack(face_images_legacy, 0)), torch.from_numpy(np.stack(face_images_v2, 0)), face_info_v2, json.dumps(points_list), final_bboxes, face_bboxes_legacy)
 
 class WanFaceStitcherV3:
     @classmethod
@@ -388,9 +346,9 @@ class WanFaceStitcherV3:
         return {
             "required": {
                 "destination_images": ("IMAGE",),
-                "face_images_v2": ("IMAGE", {"tooltip": "Must come from PoseAndFaceDetectionV3 (upscaled faces)."}),
-                "face_info_v2": ("FACE_INFO", {"tooltip": "Must come from PoseAndFaceDetectionV3."}),
-                "mode": (["Resize Face to Dest", "Resize Dest to Fit Face"], {"default": "Resize Dest to Fit Face", "tooltip": "Mode B upscales the background so the restored face fits 1:1."}),
+                "face_images_v2": ("IMAGE",),
+                "face_info_v2": ("FACE_INFO",),
+                "mode": (["Resize Face to Dest", "Resize Dest to Fit Face"], {"default": "Resize Dest to Fit Face"}),
                 "blend_feather": ("INT", {"default": 32, "min": 0, "max": 512, "step": 1}),
             },
         }
@@ -399,188 +357,67 @@ class WanFaceStitcherV3:
     RETURN_NAMES = ("stitched_images",)
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess"
-    DESCRIPTION = "V2 Stitcher: Supports smart upscaling of the destination image to match the resolution of restored faces."
+    DESCRIPTION = "V2 Stitcher: Fügt V2-Faces wieder ein."
 
     def process(self, destination_images, face_images_v2, face_info_v2, mode, blend_feather):
-        dest_np = destination_images.cpu().numpy() # (B, H, W, 3)
-        faces_np = face_images_v2.cpu().numpy() # (B, H_face, W_face, 3)
+        dest_np = destination_images.cpu().numpy()
+        faces_np = face_images_v2.cpu().numpy()
+        B, H_dest, W_dest, _ = dest_np.shape
         
-        batch_size = len(dest_np)
-        if len(face_info_v2) == 0:
-             return (destination_images,)
+        if len(face_info_v2) == 0: return (destination_images,)
 
-        # --- Determine Global Output Resolution ---
-        target_dest_w, target_dest_h = dest_np.shape[2], dest_np.shape[1]
-        
+        # Smart Scale Calc
+        target_w, target_h = W_dest, H_dest
         if mode == "Resize Dest to Fit Face":
-            # 1. Find the reference scale factor from the Champion
-            # Look for the first valid face info to determine tensor/original relationship
-            ref_info = next((f for f in face_info_v2 if f.get("valid", False)), None)
-            
-            if ref_info:
-                # Size of the tensor coming out of Extractor V3 (The Champion Size)
-                tensor_w, tensor_h = ref_info["target_tensor_size"]
-                
-                # Size of the image coming INTO this node (Result of Face Restore)
-                restored_h, restored_w = faces_np.shape[1], faces_np.shape[2]
-                
-                # Calculate how much the face was upscaled externally (e.g., CodeFormer)
-                # If Tensor was 512 and Restored is 1024, factor is 2.0.
-                external_upscale_factor = restored_w / tensor_w if tensor_w > 0 else 1.0
-                
-                # Calculate how much the Face was upscaled internally during V3 Extraction (Champion)
-                # To do this cleanly without per-frame wobble, we rely on the Champion logic:
-                # The Extractor V3 scaled EVERYTHING to [tensor_w, tensor_h].
-                # This tensor represents the "Best Detail" available in the original video.
-                
-                # If we want the background to match the detail level of the restored face:
-                # We need to scale the background by the SAME factor the Champion Face was scaled.
-                
-                # Find the crop width of the champion in the original video?
-                # Actually, FaceInfo stores `crop_coords`.
-                # Width of crop in original = x2 - x1.
-                # Scale Factor = restored_w / (x2 - x1).
-                # But (x2 - x1) varies per frame!
-                
-                # Correct Logic for "Resize Dest to Fit Face":
-                # We want the RESTORED face to fit 1:1 onto the new background without downscaling.
-                # 1. Take a frame (e.g. frame 0 or the Champion frame).
-                # 2. See how big the crop was in the ORIGINAL image (W_crop_orig).
-                # 3. See how big the RESTORED face is (W_restored).
-                # 4. Global Scale = W_restored / W_crop_orig.
-                # 5. Apply Global Scale to Original Background Width.
-                
-                # To avoid jitter, we must pick ONE scale factor for the whole video.
-                # We pick the scale factor implied by the "Champion" (Target Tensor Size).
-                
-                # In V3 Extractor, we upscaled the Champion Crop to `target_tensor_size`.
-                # Now we have `restored_size`.
-                # Total effective scale for the champion = restored_w / champion_crop_w_orig.
-                
-                # Since `target_tensor_size` was derived directly from the Champion with a slight limit,
-                # we can approximate the Global Scale Factor by:
-                # Factor = (restored_w / original_image_w) * (original_image_w / crop_w) ... complicated.
-                
-                # Simpler:
-                # The Extractor V3 output IS the resolution we want to honor.
-                # We simply check the scaling factor between the Input Face Tensor and the Restored Face.
-                # But we also need to account for the extraction resize.
-                
-                # Let's look at the first valid frame again.
-                crop_w_orig = ref_info["crop_coords"][2] - ref_info["crop_coords"][0]
-                
-                if crop_w_orig > 0:
-                    # How much bigger is the restored face compared to the original pixels of that face?
-                    total_zoom_factor = restored_w / crop_w_orig
-                    
-                    # Apply this zoom to the background
-                    orig_img_w, orig_img_h = ref_info["original_img_shape"]
-                    target_dest_w = int(orig_img_w * total_zoom_factor)
-                    target_dest_h = int(orig_img_h * total_zoom_factor)
-                    
-                    print(f"StitcherV2: Upscaling Background by {total_zoom_factor:.3f}x to match face detail.")
+            valid_info = next((f for f in face_info_v2 if f.get("valid")), None)
+            if valid_info:
+                orig_crop_w = valid_info["crop_coords"][2] - valid_info["crop_coords"][0]
+                if orig_crop_w > 0:
+                    zoom = faces_np.shape[2] / orig_crop_w
+                    target_w, target_h = int(valid_info["original_img_shape"][0] * zoom), int(valid_info["original_img_shape"][1] * zoom)
 
-        # Prepare Output Batch
-        output_batch = np.zeros((batch_size, target_dest_h, target_dest_w, 3), dtype=np.float32)
+        out = np.zeros((B, target_h, target_w, 3), dtype=np.float32)
 
-        for i in tqdm(range(batch_size), desc="FaceV2: Stitching"):
-            # 1. Prepare Background
-            bg_img = dest_np[i]
-            bg_h, bg_w = bg_img.shape[:2]
+        for i in tqdm(range(B), desc="V2 Stitching"):
+            bg = dest_np[i]
+            if bg.shape[1] != target_w or bg.shape[0] != target_h: bg = cv2.resize(bg, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
+            out[i] = bg
             
-            # Resize BG if needed
-            if bg_w != target_dest_w or bg_h != target_dest_h:
-                bg_img = cv2.resize(bg_img, (target_dest_w, target_dest_h), interpolation=cv2.INTER_CUBIC)
+            if i >= len(face_info_v2) or not face_info_v2[i]["valid"]: continue
             
-            output_batch[i] = bg_img
-            
-            if i >= len(face_info_v2) or not face_info_v2[i]["valid"]:
-                continue
-                
             info = face_info_v2[i]
-            face_img = faces_np[i] # Restored Face
+            # Coords projizieren
+            sx, sy = target_w / info["original_img_shape"][0], target_h / info["original_img_shape"][1]
+            c = info["crop_coords"]
+            tx1, ty1, tx2, ty2 = int(c[0]*sx), int(c[1]*sy), int(c[2]*sx), int(c[3]*sy)
+            tw, th = tx2 - tx1, ty2 - ty1
             
-            # 2. Calculate Placement Coordinates
-            # Get original crop coordinates (float)
-            ox1, oy1, ox2, oy2 = info["crop_coords"]
-            orig_w, orig_h = info["original_img_shape"]
+            if tw <= 0 or th <= 0: continue
             
-            # Scale coordinates to the Target Dest Resolution
-            scale_x = target_dest_w / orig_w
-            scale_y = target_dest_h / orig_h
+            # Face resize fit
+            face = faces_np[i]
+            if face.shape[1] != tw or face.shape[0] != th: face = cv2.resize(face, (tw, th), interpolation=cv2.INTER_AREA)
             
-            # Target box in new background
-            tx1 = int(round(ox1 * scale_x))
-            ty1 = int(round(oy1 * scale_y))
-            tx2 = int(round(ox2 * scale_x))
-            ty2 = int(round(oy2 * scale_y))
-            
-            target_w_box = tx2 - tx1
-            target_h_box = ty2 - ty1
-            
-            if target_w_box <= 0 or target_h_box <= 0: continue
-            
-            # 3. Handle Padding Removal from Restored Face?
-            # V3 Logic includes padding in the crop_coords calculation!
-            # So `face_img` corresponds exactly to `crop_coords`.
-            # However, `face_img` might have black borders if the crop went out of bounds.
-            # But since we place it onto the background at the exact projected coordinates,
-            # the black borders of the face_img should overlap with the off-screen area or the edge.
-            # We just need to resize `face_img` to `target_w_box`.
-            
-            # In "Resize Dest to Fit Face" mode, target_w_box should be very close to face_img width.
-            # In "Resize Face to Dest", we downscale here.
-            
-            fh, fw = face_img.shape[:2]
-            if fw != target_w_box or fh != target_h_box:
-                face_placed = cv2.resize(face_img, (target_w_box, target_h_box), interpolation=cv2.INTER_AREA)
-            else:
-                face_placed = face_img
-            
-            # 4. Masking & Blending
-            # Calculate feather in pixels
-            feather = min(blend_feather, target_w_box//2, target_h_box//2)
-            mask = np.ones((target_h_box, target_w_box), dtype=np.float32)
-            
-            if feather > 0:
-                # Create gradients
-                grad_h = np.linspace(0, 1, feather)
-                grad_h_inv = np.flip(grad_h)
-                
-                # Apply top/bottom
-                mask[:feather, :] *= grad_h[:, None]
-                mask[-feather:, :] *= grad_h_inv[:, None]
-                
-                # Apply left/right
-                mask[:, :feather] *= grad_h[None, :]
-                mask[:, -feather:] *= grad_h_inv[None, :]
-            
-            mask = mask[..., None]
-            
-            # 5. Paste with bounds check
-            # Coordinates in Dest
-            dx1 = max(0, tx1)
-            dy1 = max(0, ty1)
-            dx2 = min(target_dest_w, tx2)
-            dy2 = min(target_dest_h, ty2)
-            
-            # Offsets in Face Source (if clipped)
-            sx1 = dx1 - tx1
-            sy1 = dy1 - ty1
-            sx2 = sx1 + (dx2 - dx1)
-            sy2 = sy1 + (dy2 - dy1)
+            # Mask & Blend
+            mask = np.ones((th, tw, 1), dtype=np.float32)
+            if blend_feather > 0:
+                f = min(blend_feather, tw//2, th//2)
+                if f > 0:
+                    g = np.linspace(0, 1, f)
+                    mask[:f, :] *= g[:, None, None]; mask[-f:, :] *= g[::-1, None, None]
+                    mask[:, :f] *= g[None, :, None]; mask[:, -f:] *= g[None, ::-1, None]
+
+            # Clipping
+            dx1, dy1 = max(0, tx1), max(0, ty1)
+            dx2, dy2 = min(target_w, tx2), min(target_h, ty2)
+            sx1, sy1 = dx1 - tx1, dy1 - ty1
+            sx2, sy2 = sx1 + (dx2-dx1), sy1 + (dy2-dy1)
             
             if dx2 > dx1 and dy2 > dy1:
-                face_crop = face_placed[sy1:sy2, sx1:sx2]
-                mask_crop = mask[sy1:sy2, sx1:sx2]
-                bg_slice = output_batch[i, dy1:dy2, dx1:dx2]
-                
-                # Blend
-                blended = face_crop * mask_crop + bg_slice * (1.0 - mask_crop)
-                output_batch[i, dy1:dy2, dx1:dx2] = blended
+                out[i, dy1:dy2, dx1:dx2] = face[sy1:sy2, sx1:sx2] * mask[sy1:sy2, sx1:sx2] + out[i, dy1:dy2, dx1:dx2] * (1.0 - mask[sy1:sy2, sx1:sx2])
 
-        return (torch.from_numpy(output_batch),)
-
+        return (torch.from_numpy(out),)
+        
 class WanFaceExtractorV2:
     @classmethod
     def INPUT_TYPES(s):
@@ -12107,6 +11944,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataAutoBlackoutOnJitter": "Auto Blackout On Jitter",
     
 }
+
 
 
 
