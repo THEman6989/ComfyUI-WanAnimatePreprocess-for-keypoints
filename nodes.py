@@ -96,7 +96,7 @@ class PoseAndFaceDetectionV4:
                 "width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 1, "tooltip": "Breite der Pose-Generierung"}),
                 "height": ("INT", {"default": 480, "min": 64, "max": 2048, "step": 1, "tooltip": "Höhe der Pose-Generierung"}),
                 "face_resolution": ("INT", {"default": 512, "min": 256, "max": 2048, "step": 64, "tooltip": "Zielauflösung für den Gesichtsausschnitt (V2 Standard war 512)."}),
-                "face_pad_factor": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 2.0, "step": 0.05, "tooltip": "Padding um das Gesicht. 0.3 entspricht dem V2 Standard (Scale 1.3)."}),
+                "face_pad_factor": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 5.0, "step": 0.05, "tooltip": "Padding um das Gesicht. 0.3 entspricht dem V2 Standard (Scale 1.3)."}),
             },
             "optional": {
                 "retarget_image": ("IMAGE", {"default": None, "tooltip": "Optionales Referenzbild"}),
@@ -12150,6 +12150,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataAutoBlackoutOnJitter": "Auto Blackout On Jitter",
     
 }
+
 
 
 
