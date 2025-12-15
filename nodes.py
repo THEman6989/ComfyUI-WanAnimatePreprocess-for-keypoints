@@ -93,10 +93,10 @@ class PoseAndFaceDetectionV5:
             "required": {
                 "model": ("POSEMODEL",),
                 "images": ("IMAGE",),
-                "width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 1, "tooltip": "Breite der Pose-Generierung"}),
-                "height": ("INT", {"default": 480, "min": 64, "max": 2048, "step": 1, "tooltip": "Höhe der Pose-Generierung"}),
-                "face_resolution": ("INT", {"default": 512, "min": 256, "max": 2048, "step": 64, "tooltip": "Zielauflösung (Quadratisch). Wähle z.B. 768 für mehr Details."}),
-                "face_pad_factor": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 10.0, "step": 0.05, "tooltip": "Padding um das Gesicht. Erweitert den quadratischen Ausschnitt."}),
+                "width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 1, "tooltip": "Breite der Pose-Daten"}),
+                "height": ("INT", {"default": 480, "min": 64, "max": 2048, "step": 1, "tooltip": "Höhe der Pose-Daten"}),
+                "face_resolution": ("INT", {"default": 512, "min": 256, "max": 2048, "step": 64, "tooltip": "Auflösung des Gesichtsausschnitts (quadratisch)."}),
+                "face_pad_factor": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 10.0, "step": 0.05, "tooltip": "Padding um das Gesicht."}),
             },
             "optional": {
                 "retarget_image": ("IMAGE", {"default": None, "tooltip": "Optionales Referenzbild"}),
@@ -107,7 +107,7 @@ class PoseAndFaceDetectionV5:
     RETURN_NAMES = ("pose_data", "face_images", "face_info", "key_frame_body_points", "bboxes", "face_bboxes")
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess"
-    DESCRIPTION = "V4 (Square Fix): Erzwingt quadratische Crops ohne Verzerrung. Verhindert Wackeln durch Aspect-Ratio-Wechsel."
+    DESCRIPTION = "V4 (Fix): Korrigiertes Tracking & Square Crop. Keine Verzerrung mehr."
 
     def process(self, model, images, width, height, face_resolution, face_pad_factor, retarget_image=None):
         detector = model["yolo"]
@@ -125,7 +125,7 @@ class PoseAndFaceDetectionV5:
         detector.reinit()
         pose_model.reinit()
         
-        # --- 1. Retarget Image Logic ---
+        # --- 1. Retarget Logic (V2 Original) ---
         refer_pose_meta = None
         refer_img = None
         if retarget_image is not None:
@@ -139,7 +139,7 @@ class PoseAndFaceDetectionV5:
             ref_keypoints = pose_model(img_norm[None], np.array(center)[None], np.array(scale)[None])
             refer_pose_meta = load_pose_metas_from_kp2ds_seq(ref_keypoints, width=retarget_image.shape[2], height=retarget_image.shape[1])[0]
 
-        # --- 2. Detection ---
+        # --- 2. Detection (V2 Original) ---
         comfy_pbar = ProgressBar(B*2)
         progress = 0
         bboxes = []
@@ -151,10 +151,13 @@ class PoseAndFaceDetectionV5:
             if progress % 10 == 0: comfy_pbar.update_absolute(progress)
         detector.cleanup()
 
-        # --- 3. Pose ---
+        # --- 3. Pose Extraction (V2 Original - MIT SAFETY CHECK) ---
         kp2ds = []
         for img, bbox in tqdm(zip(images_np, bboxes), total=len(images_np), desc="V4 Keypoints"):
-            if bbox is None or bbox[-1] <= 0: bbox = np.array([0, 0, img.shape[1], img.shape[0]])
+            # V2 Safety Check: Verhindert Absturz bei 0-Größe BBoxen
+            if bbox is None or bbox[-1] <= 0 or (bbox[2] - bbox[0]) < 10 or (bbox[3] - bbox[1]) < 10:
+                bbox = np.array([0, 0, img.shape[1], img.shape[0]])
+
             bbox_xywh = bbox
             center, scale = bbox_from_detector(bbox_xywh, input_resolution, rescale=rescale)
             img_crop = crop(img, center, scale, (input_resolution[0], input_resolution[1]))[0]
@@ -169,77 +172,64 @@ class PoseAndFaceDetectionV5:
         kp2ds = np.concatenate(kp2ds, 0)
         pose_metas = load_pose_metas_from_kp2ds_seq(kp2ds, width=W, height=H)
 
-        # --- 4. Face Extraction (SQUARE CROP LOGIC) ---
+        # --- 4. Face Extraction (KORRIGIERT: Pixel-Koordinaten & Square Crop) ---
         face_images = []
         face_bboxes = []
         face_info = []
 
         for idx, meta in enumerate(pose_metas):
-            # 1. Keypoints holen (Face Bereich)
-            kp_face = meta['keypoints_face'][:, :2]
+            # WICHTIG: Keypoints von normalisiert (0-1) auf Pixel (W, H) umrechnen!
+            kp_face = meta['keypoints_face'][:, :2] * np.array([W, H])
             
-            # 2. Min/Max berechnen
+            # --- Square Crop Logik ---
             if kp_face.shape[0] == 0:
-                # Fallback wenn keine Face-Keypoints
-                min_x, min_y, max_x, max_y = 0, 0, 1, 1
+                # Fallback, wenn keine Pose da ist
                 cx, cy = W//2, H//2
+                max_side = 100
+                valid = False
             else:
                 min_x, min_y = np.min(kp_face, axis=0)
                 max_x, max_y = np.max(kp_face, axis=0)
+                
+                raw_w = max_x - min_x
+                raw_h = max_y - min_y
+                
                 cx = (min_x + max_x) / 2
                 cy = (min_y + max_y) / 2
+                
+                # Wir machen es quadratisch basierend auf der LÄNGSTEN Seite
+                max_side = max(raw_w, raw_h)
+                if max_side < 1: max_side = 50 # Safety
+                valid = True
 
-            raw_w = max_x - min_x
-            raw_h = max_y - min_y
-            
-            # 3. Das Quadrat berechnen (Square Logic)
-            # Wir nehmen die größte Seite als Basis, damit nichts abgeschnitten wird
-            max_side = max(raw_w, raw_h)
-            
-            # Sicherheitscheck
-            if max_side < 1: 
-                max_side = 100
-                cx, cy = W//2, H//2
-
-            # Padding draufrechnen
-            # face_pad_factor 0.0 = eng anliegendes Quadrat
-            # face_pad_factor 0.3 = etwas Luft (wie V2)
+            # Padding anwenden
             square_size = max_side * (1.0 + face_pad_factor)
-            
             half_size = square_size / 2
             
-            # Koordinaten (Float für Präzision in Info)
+            # Exakte Koordinaten (Float für FaceInfo)
             x1 = cx - half_size
             y1 = cy - half_size
             x2 = cx + half_size
             y2 = cy + half_size
             
-            # 4. Integer Koordinaten für Crop
+            # Pixel-Koordinaten für Crop (gerundet)
             ix1, iy1, ix2, iy2 = int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))
             
-            # 5. Safe Crop mit Padding (Verhindert Verzerrung am Rand!)
-            # Wir schneiden nur das aus, was im Bild ist
-            sx1 = max(0, ix1)
-            sy1 = max(0, iy1)
-            sx2 = min(W, ix2)
-            sy2 = min(H, iy2)
+            # Safe Crop mit Padding (schwarze Ränder statt Verzerrung)
+            # Wir holen nur das aus dem Bild, was wirklich da ist
+            sx1, sy1 = max(0, ix1), max(0, iy1)
+            sx2, sy2 = min(W, ix2), min(H, iy2)
             
-            crop_img = images_np[idx][sy1:sy2, sx1:sx2]
-            
-            # Falls leer (außerhalb des Bildes), schwarzes Bild
-            valid = True
-            if crop_img.size == 0:
-                crop_img = np.zeros((face_resolution, face_resolution, C), dtype=images_np.dtype)
-                valid = False
-            else:
-                # Jetzt Padden wir das, was wir abgeschnitten haben, wieder dran (Schwarz)
-                # Damit das Seitenverhältnis quadratisch bleibt!
+            if sx2 > sx1 and sy2 > sy1:
+                crop_img = images_np[idx][sy1:sy2, sx1:sx2]
+                
+                # Padding berechnen, um auf das perfekte Quadrat zu kommen
                 pad_l = sx1 - ix1
                 pad_t = sy1 - iy1
                 pad_r = ix2 - sx2
                 pad_b = iy2 - sy2
                 
-                # copyMakeBorder erwartet positive ints
+                # Ränder mit Schwarz auffüllen
                 if any([pad_l > 0, pad_t > 0, pad_r > 0, pad_b > 0]):
                     crop_img = cv2.copyMakeBorder(
                         crop_img, 
@@ -247,34 +237,29 @@ class PoseAndFaceDetectionV5:
                         cv2.BORDER_CONSTANT, 
                         value=(0,0,0)
                     )
+            else:
+                crop_img = np.zeros((face_resolution, face_resolution, C), dtype=images_np.dtype)
+                valid = False
 
-            # 6. Resize ohne Verzerrung (da crop_img jetzt quadratisch ist)
+            # Auf Zielauflösung skalieren (jetzt verzerrungsfrei, da Input quadratisch)
             face_image_resized = cv2.resize(crop_img, (face_resolution, face_resolution), interpolation=cv2.INTER_CUBIC)
-            
             face_images.append(face_image_resized)
-            # Speichere die originalen quadratischen Koordinaten für die BBox Ausgabe
             face_bboxes.append((ix1, iy1, ix2, iy2))
             
-            # 7. Info für Stitcher V3
-            # Wir übergeben die originalen, quadratischen Float-Koordinaten.
-            # Der Stitcher V3 weiß damit, dass er das Bild in dieses Quadrat projizieren muss.
+            # Info für Stitcher V3 (mit den exakten quadratischen Koordinaten)
             info_entry = {
                 "frame_index": idx,
                 "original_img_shape": (W, H),
                 "target_tensor_size": (face_resolution, face_resolution),
                 "valid": valid,
-                # Hier übergeben wir die idealen quadratischen Koordinaten (auch wenn sie über den Rand ragen)
                 "crop_coords": (x1, y1, x2, y2), 
-                # Padding ist im Bild "eingebrannt", der Stitcher muss nur projizieren.
-                # Wir setzen padding auf 0 im Info-Objekt, da der Stitcher V3
-                # 'crop_coords' nutzt, um das Zielrechteck zu definieren.
                 "padding": (0, 0, 0, 0) 
             }
             face_info.append(info_entry)
 
         face_images_tensor = torch.from_numpy(np.stack(face_images, 0))
 
-        # --- 5. Returns (Wie gehabt) ---
+        # --- 5. Output Construction (V2 Original) ---
         if retarget_image is not None and refer_pose_meta is not None:
             retarget_pose_metas = get_retarget_pose(pose_metas[0], refer_pose_meta, pose_metas, None, None)
         else:
@@ -319,7 +304,7 @@ class PoseAndFaceDetectionV5:
         }
 
         return (pose_data, face_images_tensor, face_info, json.dumps(points_dict_list), final_bboxes_list, face_bboxes)
-
+        
 class PoseAndFaceDetectionV4:
     @classmethod
     def INPUT_TYPES(s):
@@ -12386,6 +12371,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataAutoBlackoutOnJitter": "Auto Blackout On Jitter",
     
 }
+
 
 
 
