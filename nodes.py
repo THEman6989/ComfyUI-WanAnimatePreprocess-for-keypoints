@@ -86,7 +86,7 @@ FULL_BODY_LENGTH_PAIRS = TORSO_LENGTH_PAIRS + [
     (12, 13),  # left knee to left ankle
 ]
 
-class PoseAndFaceDetectionV4:
+class PoseAndFaceDetectionV6:
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -12606,6 +12606,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataAutoBlackoutOnJitter": "Auto Blackout On Jitter",
     
 }
+
 
 
 
