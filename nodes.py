@@ -86,6 +86,128 @@ FULL_BODY_LENGTH_PAIRS = TORSO_LENGTH_PAIRS + [
     (12, 13),  # left knee to left ankle
 ]
 
+class PoseAndFaceDetectionV7_NoWarp:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("POSEMODEL",),
+                "images": ("IMAGE",),
+                "width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 1, "tooltip": "Breite der Pose-Generierung"}),
+                "height": ("INT", {"default": 480, "min": 64, "max": 2048, "step": 1, "tooltip": "Höhe der Pose-Generierung"}),
+                "face_resolution": ("INT", {"default": 512, "min": 256, "max": 2048, "step": 64, "tooltip": "Zielauflösung (quadratisch)."}),
+                "face_pad_factor": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 5.0, "step": 0.05, "tooltip": "Padding um das Gesicht."}),
+            },
+            "optional": {
+                "retarget_image": ("IMAGE", {"default": None, "tooltip": "Optionales Referenzbild"}),
+            },
+        }
+
+    RETURN_TYPES = ("POSEDATA", "IMAGE", "FACE_INFO", "STRING", "BBOX", "BBOX")
+    RETURN_NAMES = ("pose_data", "face_images", "face_info", "key_frame_body_points", "bboxes", "face_bboxes")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "V7 (No Warp): V4 Tracking-Logik, aber mit Padding statt Verzerrung. Input wird quadratisch gemacht."
+
+    def process(self, model, images, width, height, face_resolution, face_pad_factor, retarget_image=None):
+        detector = model["yolo"]
+        pose_model = model["vitpose"]
+        B, H, W, C = images.shape
+
+        shape = np.array([H, W])[None]
+        images_np = images.numpy()
+
+        IMG_NORM_MEAN = np.array([0.485, 0.456, 0.406])
+        IMG_NORM_STD = np.array([0.229, 0.224, 0.225])
+        input_resolution=(256, 192)
+        rescale = 1.25
+
+        detector.reinit()
+        pose_model.reinit()
+        
+        # --- 1. Original V2/V4 Retarget Logic ---
+        refer_pose_meta = None
+        refer_img = None
+        
+        if retarget_image is not None:
+            refer_img = resize_by_area(retarget_image[0].numpy() * 255, width * height, divisor=16) / 255.0
+            ref_bbox = (detector(
+                cv2.resize(refer_img.astype(np.float32), (640, 640)).transpose(2, 0, 1)[None],
+                shape
+                )[0][0]["bbox"])
+
+            if ref_bbox is None or ref_bbox[-1] <= 0 or (ref_bbox[2] - ref_bbox[0]) < 10 or (ref_bbox[3] - ref_bbox[1]) < 10:
+                ref_bbox = np.array([0, 0, refer_img.shape[1], refer_img.shape[0]])
+
+            center, scale = bbox_from_detector(ref_bbox, input_resolution, rescale=rescale)
+            refer_img_crop = crop(refer_img, center, scale, (input_resolution[0], input_resolution[1]))[0]
+
+            img_norm = (refer_img_crop - IMG_NORM_MEAN) / IMG_NORM_STD
+            img_norm = img_norm.transpose(2, 0, 1).astype(np.float32)
+
+            ref_keypoints = pose_model(img_norm[None], np.array(center)[None], np.array(scale)[None])
+            refer_pose_meta = load_pose_metas_from_kp2ds_seq(ref_keypoints, width=retarget_image.shape[2], height=retarget_image.shape[1])[0]
+
+        # --- 2. Original V2/V4 Detection Loop ---
+        comfy_pbar = ProgressBar(B*2)
+        progress = 0
+        bboxes = []
+        for img in tqdm(images_np, total=len(images_np), desc="V7 NoWarp Detecting"):
+            det_result = detector(
+                cv2.resize(img, (640, 640)).transpose(2, 0, 1)[None],
+                shape
+            )
+            bbox_res = det_result[0][0]["bbox"]
+            bboxes.append(bbox_res)
+            
+            progress += 1
+            if progress % 10 == 0:
+                comfy_pbar.update_absolute(progress)
+
+        detector.cleanup()
+
+        # --- 3. Original V2/V4 Pose Loop ---
+        kp2ds = []
+        for img, bbox in tqdm(zip(images_np, bboxes), total=len(images_np), desc="V7 NoWarp Keypoints"):
+            if bbox is None or bbox[-1] <= 0 or (bbox[2] - bbox[0]) < 10 or (bbox[3] - bbox[1]) < 10:
+                bbox = np.array([0, 0, img.shape[1], img.shape[0]])
+
+            bbox_xywh = bbox
+            center, scale = bbox_from_detector(bbox_xywh, input_resolution, rescale=rescale)
+            img_crop = crop(img, center, scale, (input_resolution[0], input_resolution[1]))[0]
+
+            img_norm = (img_crop - IMG_NORM_MEAN) / IMG_NORM_STD
+            img_norm = img_norm.transpose(2, 0, 1).astype(np.float32)
+
+            keypoints = pose_model(img_norm[None], np.array(center)[None], np.array(scale)[None])
+            kp2ds.append(keypoints)
+            
+            progress += 1
+            if progress % 10 == 0:
+                comfy_pbar.update_absolute(progress)
+
+        pose_model.cleanup()
+
+        kp2ds = np.concatenate(kp2ds, 0)
+        pose_metas = load_pose_metas_from_kp2ds_seq(kp2ds, width=W, height=H)
+
+        # --- 4. Face Extraction (MODIFIZIERT: Padding statt Warping) ---
+        face_images = []
+        face_bboxes = []
+        face_info = []
+
+        for idx, meta in enumerate(pose_metas):
+            # V4-Logik für Box-Koordinaten
+            current_scale = 1.0 + face_pad_factor
+            face_bbox_for_image = get_face_bboxes(meta['keypoints_face'][:, :2], scale=current_scale, image_shape=(H, W))
+            
+            raw_x1, raw_x2, raw_y1, raw_y2 = face_bbox_for_image
+            raw_w = raw_x2 - raw_x1
+            raw_h = raw_y2 - raw_y1
+            
+            # --- Square Logic (V7: No Warp) ---
+            max_side = max(raw_
+
 class PoseAndFaceDetectionV6:
     @classmethod
     def INPUT_TYPES(s):
@@ -12508,6 +12630,7 @@ class PoseRetargetPromptHelper:
         return (tpl_prompt, refer_prompt, )
 
 NODE_CLASS_MAPPINGS = {
+    "PoseAndFaceDetectionV7_NoWarp": PoseAndFaceDetectionV7_NoWarp,
     "PoseAndFaceDetectionV6": PoseAndFaceDetectionV6,
     "PoseAndFaceDetectionV5": PoseAndFaceDetectionV5,
     "PoseAndFaceDetectionV4": PoseAndFaceDetectionV4,
@@ -12557,6 +12680,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataAutoBlackoutOnJitter": PoseDataAutoBlackoutOnJitter,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "PoseAndFaceDetectionV7_NoWarp": "Pose and Face Detection V7 (No Warp)",
     "PoseAndFaceDetectionV6": "Pose and Face Detection V6 (no warping face)",
     "PoseAndFaceDetectionV5": "Pose and Face Detection V5 (no warping face)",
     "PoseAndFaceDetectionV4": "Pose and Face Detection V4 (Stitcher V3 Compatible)",
@@ -12606,6 +12730,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataAutoBlackoutOnJitter": "Auto Blackout On Jitter",
     
 }
+
 
 
 
