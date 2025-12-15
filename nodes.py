@@ -86,6 +86,239 @@ FULL_BODY_LENGTH_PAIRS = TORSO_LENGTH_PAIRS + [
     (12, 13),  # left knee to left ankle
 ]
 
+class PoseAndFaceDetectionV4:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("POSEMODEL",),
+                "images": ("IMAGE",),
+                "width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 1, "tooltip": "Breite der Pose-Daten"}),
+                "height": ("INT", {"default": 480, "min": 64, "max": 2048, "step": 1, "tooltip": "Höhe der Pose-Daten"}),
+                "face_resolution": ("INT", {"default": 512, "min": 256, "max": 2048, "step": 64, "tooltip": "Auflösung des Gesichtsausschnitts (quadratisch)."}),
+                "face_pad_factor": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 10.0, "step": 0.05, "tooltip": "Padding um das Gesicht."}),
+            },
+            "optional": {
+                "retarget_image": ("IMAGE", {"default": None, "tooltip": "Optionales Referenzbild"}),
+            },
+        }
+
+    RETURN_TYPES = ("POSEDATA", "IMAGE", "FACE_INFO", "STRING", "BBOX", "BBOX")
+    RETURN_NAMES = ("pose_data", "face_images", "face_info", "key_frame_body_points", "bboxes", "face_bboxes")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePreprocess"
+    DESCRIPTION = "V4 (Final): V2-Tracking Logik + Quadratischer Crop ohne Verzerrung."
+
+    def process(self, model, images, width, height, face_resolution, face_pad_factor, retarget_image=None):
+        detector = model["yolo"]
+        pose_model = model["vitpose"]
+        B, H, W, C = images.shape
+
+        shape = np.array([H, W])[None]
+        images_np = images.numpy()
+
+        IMG_NORM_MEAN = np.array([0.485, 0.456, 0.406])
+        IMG_NORM_STD = np.array([0.229, 0.224, 0.225])
+        input_resolution=(256, 192)
+        rescale = 1.25
+
+        detector.reinit()
+        pose_model.reinit()
+        
+        # --- 1. Retarget Logic (V2 Original) ---
+        refer_pose_meta = None
+        refer_img = None
+        if retarget_image is not None:
+            refer_img = resize_by_area(retarget_image[0].numpy() * 255, width * height, divisor=16) / 255.0
+            ref_bbox = (detector(cv2.resize(refer_img.astype(np.float32), (640, 640)).transpose(2, 0, 1)[None], shape)[0][0]["bbox"])
+            if ref_bbox is None or ref_bbox[-1] <= 0: ref_bbox = np.array([0, 0, refer_img.shape[1], refer_img.shape[0]])
+            center, scale = bbox_from_detector(ref_bbox, input_resolution, rescale=rescale)
+            refer_img_crop = crop(refer_img, center, scale, (input_resolution[0], input_resolution[1]))[0]
+            img_norm = (refer_img_crop - IMG_NORM_MEAN) / IMG_NORM_STD
+            img_norm = img_norm.transpose(2, 0, 1).astype(np.float32)
+            ref_keypoints = pose_model(img_norm[None], np.array(center)[None], np.array(scale)[None])
+            refer_pose_meta = load_pose_metas_from_kp2ds_seq(ref_keypoints, width=retarget_image.shape[2], height=retarget_image.shape[1])[0]
+
+        # --- 2. Detection (V2 Original) ---
+        comfy_pbar = ProgressBar(B*2)
+        progress = 0
+        bboxes = []
+        for img in tqdm(images_np, total=len(images_np), desc="V4 Detecting"):
+            det_result = detector(cv2.resize(img, (640, 640)).transpose(2, 0, 1)[None], shape)
+            bbox_res = det_result[0][0]["bbox"]
+            bboxes.append(bbox_res)
+            progress += 1
+            if progress % 10 == 0: comfy_pbar.update_absolute(progress)
+        detector.cleanup()
+
+        # --- 3. Pose Extraction (V2 Original) ---
+        kp2ds = []
+        for img, bbox in tqdm(zip(images_np, bboxes), total=len(images_np), desc="V4 Keypoints"):
+            if bbox is None or bbox[-1] <= 0: bbox = np.array([0, 0, img.shape[1], img.shape[0]])
+            bbox_xywh = bbox
+            center, scale = bbox_from_detector(bbox_xywh, input_resolution, rescale=rescale)
+            img_crop = crop(img, center, scale, (input_resolution[0], input_resolution[1]))[0]
+            img_norm = (img_crop - IMG_NORM_MEAN) / IMG_NORM_STD
+            img_norm = img_norm.transpose(2, 0, 1).astype(np.float32)
+            keypoints = pose_model(img_norm[None], np.array(center)[None], np.array(scale)[None])
+            kp2ds.append(keypoints)
+            progress += 1
+            if progress % 10 == 0: comfy_pbar.update_absolute(progress)
+        pose_model.cleanup()
+
+        kp2ds = np.concatenate(kp2ds, 0)
+        pose_metas = load_pose_metas_from_kp2ds_seq(kp2ds, width=W, height=H)
+
+        # --- 4. Face Extraction (SQUARE CROP LOGIC) ---
+        face_images = []
+        face_bboxes = []
+        face_info = []
+
+        for idx, meta in enumerate(pose_metas):
+            # WICHTIG: Keypoints von normalisiert (0-1) auf Pixel (W, H) umrechnen!
+            # Wir nehmen nur die Face-Keypoints (Index 23 bis Ende im 133-Format, oder was AAPoseMeta liefert)
+            # AAPoseMeta liefert 'keypoints_face' als numpy array.
+            
+            # Koordinaten sind normalisiert, also * W und * H
+            kp_face = meta['keypoints_face'][:, :2] * np.array([W, H])
+            
+            # --- BBox Berechnung ---
+            if kp_face.shape[0] == 0:
+                # Fallback, wenn keine Pose da ist
+                cx, cy = W/2, H/2
+                max_side = 100
+                valid = False
+            else:
+                min_x, min_y = np.min(kp_face, axis=0)
+                max_x, max_y = np.max(kp_face, axis=0)
+                
+                raw_w = max_x - min_x
+                raw_h = max_y - min_y
+                
+                cx = (min_x + max_x) / 2
+                cy = (min_y + max_y) / 2
+                
+                # Wir machen es quadratisch basierend auf der LÄNGSTEN Seite
+                max_side = max(raw_w, raw_h)
+                if max_side < 1: max_side = 50 # Safety
+                valid = True
+
+            # Padding anwenden (1.0 = eng, 1.3 = normal)
+            square_size = max_side * (1.0 + face_pad_factor)
+            half_size = square_size / 2
+            
+            # Exakte Koordinaten (Float für FaceInfo)
+            x1 = cx - half_size
+            y1 = cy - half_size
+            x2 = cx + half_size
+            y2 = cy + half_size
+            
+            # Pixel-Koordinaten für Crop (gerundet)
+            ix1, iy1, ix2, iy2 = int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))
+            
+            # Safe Crop mit Padding (schwarze Ränder statt Verzerrung)
+            # Wir holen nur das aus dem Bild, was wirklich da ist (Clamping)
+            sx1 = max(0, ix1)
+            sy1 = max(0, iy1)
+            sx2 = min(W, ix2)
+            sy2 = min(H, iy2)
+            
+            # Crop durchführen
+            if sx2 > sx1 and sy2 > sy1:
+                crop_img = images_np[idx][sy1:sy2, sx1:sx2]
+                
+                # Padding berechnen, um wieder auf das volle Quadrat zu kommen
+                # Wenn ix1 < 0 ist (links raus), müssen wir links padden.
+                pad_l = sx1 - ix1
+                pad_t = sy1 - iy1
+                pad_r = ix2 - sx2
+                pad_b = iy2 - sy2
+                
+                # Ränder mit Schwarz auffüllen, damit das Bild quadratisch bleibt
+                if any([pad_l > 0, pad_t > 0, pad_r > 0, pad_b > 0]):
+                    crop_img = cv2.copyMakeBorder(
+                        crop_img, 
+                        max(0, pad_t), max(0, pad_b), max(0, pad_l), max(0, pad_r), 
+                        cv2.BORDER_CONSTANT, 
+                        value=(0,0,0)
+                    )
+            else:
+                # Wenn gar nichts im Bild ist (komplett außerhalb)
+                crop_img = np.zeros((face_resolution, face_resolution, C), dtype=images_np.dtype)
+                valid = False
+
+            # Auf Zielauflösung skalieren (jetzt verzerrungsfrei, da Input quadratisch ist)
+            # Falls durch Rundungsfehler nicht exakt quadratisch, erzwingt Resize es jetzt (Verzerrung minimalst)
+            if crop_img.shape[0] != face_resolution or crop_img.shape[1] != face_resolution:
+                face_image_resized = cv2.resize(crop_img, (face_resolution, face_resolution), interpolation=cv2.INTER_CUBIC)
+            else:
+                face_image_resized = crop_img
+
+            face_images.append(face_image_resized)
+            face_bboxes.append((ix1, iy1, ix2, iy2))
+            
+            # Info für Stitcher V3 (mit den exakten quadratischen Koordinaten)
+            info_entry = {
+                "frame_index": idx,
+                "original_img_shape": (W, H),
+                "target_tensor_size": (face_resolution, face_resolution),
+                "valid": valid,
+                # Wir geben dem Stitcher das volle Quadrat inkl. überstehender Bereiche
+                "crop_coords": (x1, y1, x2, y2), 
+                # Padding setzen wir auf 0, weil wir das Padding ins Bild "gebacken" haben (schwarze Ränder).
+                # Der Stitcher projiziert einfach das Bild zurück in crop_coords.
+                "padding": (0, 0, 0, 0) 
+            }
+            face_info.append(info_entry)
+
+        face_images_tensor = torch.from_numpy(np.stack(face_images, 0))
+
+        # --- 5. Output Construction (V2 Original) ---
+        if retarget_image is not None and refer_pose_meta is not None:
+            retarget_pose_metas = get_retarget_pose(pose_metas[0], refer_pose_meta, pose_metas, None, None)
+        else:
+            retarget_pose_metas = [AAPoseMeta.from_humanapi_meta(meta) for meta in pose_metas]
+
+        final_bboxes_list = []
+        for bb in bboxes:
+            bb_flat = np.array(bb).flatten()
+            if bb_flat.shape[0] >= 4:
+                bbox_ints = tuple(int(v) for v in bb_flat[:4])
+            else:
+                bbox_ints = (0, 0, 0, 0)
+            final_bboxes_list.append(bbox_ints)
+
+        key_frame_num = 4 if B >= 4 else 1
+        key_frame_step = len(pose_metas) // key_frame_num
+        key_frame_index_list = list(range(0, len(pose_metas), key_frame_step))
+        key_points_index = [0, 1, 2, 5, 8, 11, 10, 13]
+        
+        points_dict_list = [] 
+        for key_frame_index in key_frame_index_list:
+            if key_frame_index < len(pose_metas):
+                keypoints_body_list = []
+                body_key_points = pose_metas[key_frame_index]['keypoints_body']
+                for each_index in key_points_index:
+                    each_keypoint = body_key_points[each_index]
+                    if None is each_keypoint: continue
+                    keypoints_body_list.append(each_keypoint)
+
+                if keypoints_body_list:
+                    keypoints_body = np.array(keypoints_body_list)[:, :2]
+                    wh = np.array([[pose_metas[0]['width'], pose_metas[0]['height']]])
+                    points = (keypoints_body * wh).astype(np.int32)
+                    for point in points:
+                        points_dict_list.append({"x": int(point[0]), "y": int(point[1])})
+
+        pose_data = {
+            "retarget_image": refer_img if retarget_image is not None else None,
+            "pose_metas": retarget_pose_metas,
+            "refer_pose_meta": refer_pose_meta if retarget_image is not None else None,
+            "pose_metas_original": pose_metas,
+        }
+
+        return (pose_data, face_images_tensor, face_info, json.dumps(points_dict_list), final_bboxes_list, face_bboxes)
+
 class PoseAndFaceDetectionV5:
     @classmethod
     def INPUT_TYPES(s):
@@ -12275,6 +12508,7 @@ class PoseRetargetPromptHelper:
         return (tpl_prompt, refer_prompt, )
 
 NODE_CLASS_MAPPINGS = {
+    "PoseAndFaceDetectionV6": PoseAndFaceDetectionV6,
     "PoseAndFaceDetectionV5": PoseAndFaceDetectionV5,
     "PoseAndFaceDetectionV4": PoseAndFaceDetectionV4,
     "PoseAndFaceDetectionV3": PoseAndFaceDetectionV3,
@@ -12323,6 +12557,7 @@ NODE_CLASS_MAPPINGS = {
     "PoseDataAutoBlackoutOnJitter": PoseDataAutoBlackoutOnJitter,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "PoseAndFaceDetectionV6": "Pose and Face Detection V6 (no warping face)",
     "PoseAndFaceDetectionV5": "Pose and Face Detection V5 (no warping face)",
     "PoseAndFaceDetectionV4": "Pose and Face Detection V4 (Stitcher V3 Compatible)",
     "PoseAndFaceDetectionV3": "Pose and Face Detection V3 (Champion Aspect)",
@@ -12371,6 +12606,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataAutoBlackoutOnJitter": "Auto Blackout On Jitter",
     
 }
+
 
 
 
