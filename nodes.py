@@ -206,7 +206,110 @@ class PoseAndFaceDetectionV7_NoWarp:
             raw_h = raw_y2 - raw_y1
             
             # --- Square Logic (V7: No Warp) ---
-            max_side = max(raw_
+            max_side = max(raw_w, raw_h)
+            center_x = raw_x1 + raw_w / 2
+            center_y = raw_y1 + raw_h / 2
+            
+            sq_x1 = int(center_x - max_side / 2)
+            sq_y1 = int(center_y - max_side / 2)
+            sq_x2 = sq_x1 + max_side
+            sq_y2 = sq_y1 + max_side
+            
+            # Clamping
+            safe_x1 = max(0, sq_x1)
+            safe_y1 = max(0, sq_y1)
+            safe_x2 = min(W, sq_x2)
+            safe_y2 = min(H, sq_y2)
+            
+            valid = True
+            
+            # Crop mit Padding
+            if safe_x2 > safe_x1 and safe_y2 > safe_y1:
+                crop_img = images_np[idx][safe_y1:safe_y2, safe_x1:safe_x2]
+                
+                pad_l = safe_x1 - sq_x1
+                pad_t = safe_y1 - sq_y1
+                pad_r = sq_x2 - safe_x2
+                pad_b = sq_y2 - safe_y2
+                
+                if any([pad_l > 0, pad_t > 0, pad_r > 0, pad_b > 0]):
+                    crop_img = cv2.copyMakeBorder(
+                        crop_img, 
+                        max(0, pad_t), max(0, pad_b), max(0, pad_l), max(0, pad_r), 
+                        cv2.BORDER_CONSTANT, 
+                        value=(0,0,0)
+                    )
+            else:
+                crop_img = np.zeros((face_resolution, face_resolution, C), dtype=images_np.dtype)
+                valid = False
+
+            # Resize (jetzt verzerrungsfrei)
+            if crop_img.shape[0] != face_resolution or crop_img.shape[1] != face_resolution:
+                face_image_resized = cv2.resize(crop_img, (face_resolution, face_resolution), interpolation=cv2.INTER_CUBIC)
+            else:
+                face_image_resized = crop_img
+
+            face_images.append(face_image_resized)
+            face_bboxes.append((sq_x1, sq_y1, sq_x2, sq_y2))
+            
+            info_entry = {
+                "frame_index": idx,
+                "original_img_shape": (W, H),
+                "target_tensor_size": (face_resolution, face_resolution),
+                "valid": valid,
+                "crop_coords": (float(sq_x1), float(sq_y1), float(sq_x2), float(sq_y2)),
+                "padding": (0, 0, 0, 0)
+            }
+            face_info.append(info_entry)
+
+        face_images_tensor = torch.from_numpy(np.stack(face_images, 0))
+
+        # --- 5. Restliche Outputs (unverändert) ---
+        if retarget_image is not None and refer_pose_meta is not None:
+            retarget_pose_metas = get_retarget_pose(pose_metas[0], refer_pose_meta, pose_metas, None, None)
+        else:
+            retarget_pose_metas = [AAPoseMeta.from_humanapi_meta(meta) for meta in pose_metas]
+
+        final_bboxes_list = []
+        for bb in bboxes:
+            bb_flat = np.array(bb).flatten()
+            if bb_flat.shape[0] >= 4:
+                bbox_ints = tuple(int(v) for v in bb_flat[:4])
+            else:
+                bbox_ints = (0, 0, 0, 0)
+            final_bboxes_list.append(bbox_ints)
+
+        key_frame_num = 4 if B >= 4 else 1
+        key_frame_step = len(pose_metas) // key_frame_num
+        key_frame_index_list = list(range(0, len(pose_metas), key_frame_step))
+        key_points_index = [0, 1, 2, 5, 8, 11, 10, 13]
+        
+        points_dict_list = [] 
+        for key_frame_index in key_frame_index_list:
+            if key_frame_index < len(pose_metas):
+                keypoints_body_list = []
+                body_key_points = pose_metas[key_frame_index]['keypoints_body']
+                for each_index in key_points_index:
+                    each_keypoint = body_key_points[each_index]
+                    if None is each_keypoint:
+                        continue
+                    keypoints_body_list.append(each_keypoint)
+
+                if keypoints_body_list:
+                    keypoints_body = np.array(keypoints_body_list)[:, :2]
+                    wh = np.array([[pose_metas[0]['width'], pose_metas[0]['height']]])
+                    points = (keypoints_body * wh).astype(np.int32)
+                    for point in points:
+                        points_dict_list.append({"x": int(point[0]), "y": int(point[1])})
+
+        pose_data = {
+            "retarget_image": refer_img if retarget_image is not None else None,
+            "pose_metas": retarget_pose_metas,
+            "refer_pose_meta": refer_pose_meta if retarget_image is not None else None,
+            "pose_metas_original": pose_metas,
+        }
+
+        return (pose_data, face_images_tensor, face_info, json.dumps(points_dict_list), final_bboxes_list, face_bboxes)
 
 class PoseAndFaceDetectionV6:
     @classmethod
@@ -12730,6 +12833,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PoseDataAutoBlackoutOnJitter": "Auto Blackout On Jitter",
     
 }
+
 
 
 
