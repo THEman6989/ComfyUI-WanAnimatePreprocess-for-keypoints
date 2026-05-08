@@ -471,6 +471,9 @@ from .node_categories.WanAnimatePreprocess.nodes import *
 # NLFDataHandDebugV11 -> node_categories/WanAnimate/NLF.py
 # NLFDataHandDebugV12 -> node_categories/WanAnimate/NLF.py
 # FrameSubsamplerForDepth -> node_categories/WanAnimatePreprocess/Video.py
+# FrameSubsamplerForDepthRestore -> node_categories/WanAnimatePreprocess/Video.py
+# FrameSubsamplerForDepthBatch -> node_categories/WanAnimatePreprocess/Video.py
+# FrameSubsamplerForDepthBatchRestore -> node_categories/WanAnimatePreprocess/Video.py
 # NLFPhysicalScalerV1 -> node_categories/WanAnimatePreprocess/Scaling.py
 # RenderNLFPosesOrthographicMimic -> node_categories/WanAnimatePreprocess/Mimic.py
 # NLFPoseDataSelectFrame -> node_categories/WanAnimatePreprocess/NLF.py
@@ -573,6 +576,9 @@ NODE_CLASS_MAPPINGS = {
     "RenderNLFPosesDirectPoseDataMimic16": RenderNLFPosesDirectPoseDataMimic16,
     "PoseCalibrationManipulator2": PoseCalibrationManipulator2,
     "FrameSubsamplerForDepth": FrameSubsamplerForDepth,
+    "FrameSubsamplerForDepthRestore": FrameSubsamplerForDepthRestore,
+    "FrameSubsamplerForDepthBatch": FrameSubsamplerForDepthBatch,
+    "FrameSubsamplerForDepthBatchRestore": FrameSubsamplerForDepthBatchRestore,
     "PoseGlobalPerspectiveScalerV50": PoseGlobalPerspectiveScalerV50,
     "PoseGlobalPerspectiveScalerV51": PoseGlobalPerspectiveScalerV51,
     "NLFProportionalRetargeterV14": NLFProportionalRetargeterV14,
@@ -705,6 +711,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RenderNLFPosesDirectPoseDataMimic16": "Render NLF Poses Mimic 16 (Flat 3D PoseData)",
     "PoseCalibrationManipulator2": "Pose Calibration Manipulator2",
     "FrameSubsamplerForDepth": "Frame Subsampler For Depth (VRAM Saver)",
+    "FrameSubsamplerForDepthRestore": "Frame Subsampler For Depth Restore (Lanczos)",
+    "FrameSubsamplerForDepthBatch": "Frame Subsampler For Depth Batch (VRAM Saver)",
+    "FrameSubsamplerForDepthBatchRestore": "Frame Subsampler For Depth Batch Restore (Loop)",
     "PoseGlobalPerspectiveScalerV50": "Pose Global Perspective Scaler (V50)",
     "PoseGlobalPerspectiveScalerV51": "Pose Global Perspective Scaler (V51)",
     "NLFProportionalRetargeterV14": "NLF Proportional Retargeter V14",
@@ -739,5 +748,3 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     
     
 }
-
-
