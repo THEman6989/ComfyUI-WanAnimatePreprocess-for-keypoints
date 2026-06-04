@@ -1,3 +1,11 @@
 from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
+try:
+    from .mask_researcher_tools import NODE_CLASS_MAPPINGS as MASK_RESEARCHER_NODE_CLASS_MAPPINGS
+    from .mask_researcher_tools import NODE_DISPLAY_NAME_MAPPINGS as MASK_RESEARCHER_NODE_DISPLAY_NAME_MAPPINGS
+    NODE_CLASS_MAPPINGS.update(MASK_RESEARCHER_NODE_CLASS_MAPPINGS)
+    NODE_DISPLAY_NAME_MAPPINGS.update(MASK_RESEARCHER_NODE_DISPLAY_NAME_MAPPINGS)
+except Exception as exc:
+    print("[comfyui-ex-rvc] Failed to load Mask Researcher Tools:", exc)
+
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
